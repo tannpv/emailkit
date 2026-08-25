@@ -1,6 +1,7 @@
 package emailkit
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -209,6 +210,83 @@ func TestWebhook_Complained(t *testing.T) {
 	}
 	if s := f.suppress[0]; s.email != "spam@x.com" || s.reason != "complained" {
 		t.Fatalf("suppress = %+v, want {spam@x.com complained}", s)
+	}
+}
+
+// TestSuppression_MixedCaseEventSuppressesLaterSend is the end-to-end assertion
+// that the two halves of the suppression policy agree. It deliberately spans
+// both files: the webhook WRITES the suppression key and deliver() READS it, and
+// the defect it guards lived in neither half on its own — each was internally
+// consistent, they simply produced different keys. A unit test on either side
+// alone cannot see that, which is why this one drives a real signed webhook
+// through Handle and then a real Send through the same Store.
+//
+// The provider echoes the address in whatever case (and padding) its own payload
+// carried; the application later sends to the address as its database holds it.
+// Unless both are reduced to one form by one definition, an exact-match Store
+// misses and the bounced address keeps being mailed — the reputation damage that
+// hits every project on the shared sending domain.
+func TestSuppression_MixedCaseEventSuppressesLaterSend(t *testing.T) {
+	// What the application will send to later: the ordinary, already-lowercase
+	// form. Only the webhook's spelling varies between cases.
+	const sendTo = "user@example.com"
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "mixed-case hard bounce",
+			body: `{"type":"email.bounced","data":{"email_id":"e_mix","to":"User@Example.COM","bounce":{"type":"Permanent","subType":"General","message":"no such user"}}}`,
+		},
+		{
+			name: "mixed-case complaint",
+			body: `{"type":"email.complained","data":{"email_id":"e_cmp","to":["USER@Example.com"]}}`,
+		},
+		{
+			// Whitespace is never part of an addr-spec, but a provider echoing
+			// its own payload may pad it. Trimming is the other half of
+			// normalizeAddress and this is what asserts it.
+			name: "padded mixed-case hard bounce",
+			body: `{"type":"email.bounced","data":{"email_id":"e_pad","to":"  User@Example.com  ","bounce":{"type":"Permanent","subType":"General","message":"no such user"}}}`,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			st := &fakeStore{}
+
+			// Half one: the provider's event reaches the suppression list.
+			if _, err := serve(frozenWebhook(st, testSecret), signedRequest(t, testSecret, testNow, c.body)); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			if len(st.suppress) != 1 {
+				t.Fatalf("want exactly one Suppress call, got %+v", st.suppress)
+			}
+			if got := st.suppress[0].email; got != sendTo {
+				t.Fatalf("webhook suppressed %q but the send path queries %q: "+
+					"an exact-match Store never matches and the dead address keeps being mailed", got, sendTo)
+			}
+
+			// Half two: the next send to that address must be withheld.
+			sn := &fakeSvcSender{}
+			svc := newTestService(st, sn, "key")
+			svc.Send(context.Background(), "k", sendTo, nil)
+			svc.Wait()
+
+			logs, queried := st.snapshot()
+			if calls, to, _, _ := sn.seen(); calls != 0 {
+				t.Fatalf("suppressed address was mailed anyway: %d send(s) to %q. "+
+					"The webhook stored %q and deliver() queried %v — both sides must "+
+					"go through normalizeAddress", calls, to, st.suppress[0].email, queried)
+			}
+			if len(queried) != 1 || queried[0] != sendTo {
+				t.Fatalf("deliver() queried %v, want exactly [%q]", queried, sendTo)
+			}
+			if len(logs) != 1 || logs[0].Status != StatusSuppressed {
+				t.Fatalf("want one suppressed audit row, got %+v", logs)
+			}
+		})
 	}
 }
 

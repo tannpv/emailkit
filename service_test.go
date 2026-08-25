@@ -85,11 +85,24 @@ func (f *fakeStore) MarkByProviderID(_ context.Context, providerID, status strin
 	return f.markErr
 }
 
+// Suppress records the call AND applies it to the same map IsSuppressed reads,
+// with an EXACT-MATCH key. That is what makes this fake a faithful model of a
+// real store: emailkit's Store contract says addresses arrive already
+// normalised, so an implementation is entitled to a plain `WHERE email = $1`.
+// A fake that lowercased here would absorb the very asymmetry the suppression
+// tests exist to detect and pass no matter which side forgot to normalise.
 func (f *fakeStore) Suppress(_ context.Context, email, reason string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.suppress = append(f.suppress, suppressCall{email: email, reason: reason})
-	return f.suppressErr
+	if f.suppressErr != nil {
+		return f.suppressErr
+	}
+	if f.suppressed == nil {
+		f.suppressed = map[string]bool{}
+	}
+	f.suppressed[email] = true
+	return nil
 }
 
 func (f *fakeStore) snapshot() ([]SendRecord, []string) {
@@ -165,8 +178,8 @@ func TestDeliver_SuppressedSkips(t *testing.T) {
 	}
 }
 
-// TestDeliver_SuppressionLookupIsCaseInsensitive pins the strings.ToLower in
-// deliver(). The suppression entry is lowercase and the recipient is not:
+// TestDeliver_SuppressionLookupIsCaseInsensitive pins the normalizeAddress call
+// in deliver(). The suppression entry is lowercase and the recipient is not:
 // without normalisation the lookup misses and a suppressed address is mailed.
 func TestDeliver_SuppressionLookupIsCaseInsensitive(t *testing.T) {
 	st := &fakeStore{suppressed: map[string]bool{"user@example.com": true}}
@@ -184,6 +197,31 @@ func TestDeliver_SuppressionLookupIsCaseInsensitive(t *testing.T) {
 	}
 	if len(logs) != 1 || logs[0].Status != StatusSuppressed {
 		t.Fatalf("want one suppressed log, got %+v", logs)
+	}
+}
+
+// TestNormalizeAddress pins the policy itself, including its deliberate limits.
+// The "unchanged" rows are the load-bearing ones: they fail if someone later
+// adds "+tag" stripping or Gmail dot-folding, which would suppress addresses
+// that never bounced and lock live users out of password resets.
+func TestNormalizeAddress(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"already normalised", "user@example.com", "user@example.com"},
+		{"mixed case", "User@Example.COM", "user@example.com"},
+		{"surrounding spaces", "  user@example.com  ", "user@example.com"},
+		{"tab and newline", "\tuser@example.com\n", "user@example.com"},
+		{"whitespace only", "   ", ""},
+		{"empty", "", ""},
+		{"plus tag is part of the identity", "User+news@Example.com", "user+news@example.com"},
+		{"dots are part of the identity", "First.Last@Example.com", "first.last@example.com"},
+		{"inner space is not trimmed", "us er@example.com", "us er@example.com"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := normalizeAddress(c.in); got != c.want {
+				t.Fatalf("normalizeAddress(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
 	}
 }
 

@@ -33,6 +33,19 @@ import (
 // Store methods are also called on a goroutine the caller does not wait for.
 // A method that blocks forever leaks that goroutine and stalls Wait; use the
 // supplied ctx (or your driver's own timeout) to bound it.
+//
+// ADDRESS NORMALISATION CONTRACT: every address emailkit passes to Suppress or
+// IsSuppressed has ALREADY been normalised by normalizeAddress — lowercased and
+// whitespace-trimmed. Implementations MUST NOT re-case or otherwise rewrite it,
+// and MAY compare it exactly (a plain `WHERE email = $1` on a plain column is
+// correct; no LOWER() index or citext column is required). The point of stating
+// it here is that both sides come from one definition in this package, so an
+// implementation that added its own second normalisation would be a second
+// source of truth for the same policy — and the two would drift.
+//
+// The address written to LogSend is deliberately NOT normalised: that row is the
+// audit trail of what was actually mailed, and it should record the address as
+// the caller gave it.
 type Store interface {
 	// send path
 	IsSuppressed(ctx context.Context, email string) (bool, error)
@@ -256,7 +269,7 @@ func (s *Service) deliver(ctx context.Context, to, subject, html, label string) 
 	// on the list — the exact outcome suppression exists to prevent. A
 	// withheld email is recoverable; a complaint-driven domain reputation
 	// hit is not.
-	sup, err := s.store.IsSuppressed(ctx, strings.ToLower(to))
+	sup, err := s.store.IsSuppressed(ctx, normalizeAddress(to))
 	if err != nil {
 		s.log().Warn("suppression lookup failed; withholding send",
 			"label", label, "domain", domainOf(to), "err", err)
@@ -368,6 +381,38 @@ func (s *Service) audit(ctx context.Context, to, subject, label, status string, 
 		s.log().Error("email audit write failed",
 			"label", label, "domain", domainOf(to), "status", status, "err", err)
 	}
+}
+
+// normalizeAddress is the SINGLE definition of the suppression-key policy: the
+// form in which an address is both written to and read from the suppression
+// list. Both halves of that policy must agree or the list does nothing — a hard
+// bounce for "User@Example.com" that stored the raw address, while the next send
+// queried "user@example.com", left an exact-match Store missing and the dead
+// address being mailed forever. That is the whole harm the list exists to
+// prevent, so the policy gets one definition and no call site spells it out
+// again. See the Store doc comment for the contract this places on
+// implementations.
+//
+// WHAT IT DOES, AND DELIBERATELY NOTHING MORE:
+//
+//   - Lowercase. RFC 5321 makes the local part technically case-SENSITIVE, but
+//     no mailbox provider in practice treats "User@" and "user@" as different
+//     people, and a provider echoing a bounce back in a different case is
+//     routine. Folding case can therefore only over-suppress an address the
+//     same human owns; not folding it under-suppresses a genuinely dead one.
+//   - Trim surrounding whitespace. Free, and a provider may echo a padded
+//     address out of its own payload. Leading/trailing space is never part of an
+//     addr-spec, so trimming cannot change which mailbox is meant.
+//
+// NOT stripping "+tag" suffixes and NOT removing dots from the local part, even
+// though both are Gmail conventions. Those change IDENTITY, not spelling:
+// "a+news@x.com" and "a@x.com" are separate addresses at most providers, and
+// collapsing them would suppress mail to an address that never bounced — locking
+// a live user out of password resets on the strength of a different mailbox's
+// bounce. Over-normalising fails in the direction that silently drops real mail,
+// which is worse than the miss it would fix.
+func normalizeAddress(addr string) string {
+	return strings.ToLower(strings.TrimSpace(addr))
 }
 
 // domainOf reduces an address to the part safe to log. A malformed address

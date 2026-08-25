@@ -127,7 +127,17 @@ func (h *WebhookHandler) Handle(w http.ResponseWriter, r *http.Request) error {
 
 	ctx := r.Context()
 	id := event.Data.EmailID
-	to := firstRecipient(event.Data.To)
+	// Normalised HERE, once, rather than at each Suppress call below: the two
+	// call sites are one policy, and the bug this replaces was exactly one of
+	// them being written without it. Normalising at the single point where the
+	// address enters the handler means a third event type added later cannot
+	// forget. It must be the same normalizeAddress deliver() reads through —
+	// the suppression list is only worth anything when the write key and the
+	// read key are produced by one definition.
+	//
+	// Also tightens the `to != ""` guards below: a whitespace-only recipient
+	// trims to empty and is correctly skipped instead of suppressing " ".
+	to := normalizeAddress(firstRecipient(event.Data.To))
 
 	// An event can trigger TWO store calls (a bounce writes the log row AND may
 	// suppress). Both are attempted even when the first fails, and every result

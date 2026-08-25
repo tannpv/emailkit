@@ -73,6 +73,35 @@ func TestSend_ValidJSONNoProviderID_ReturnsError(t *testing.T) {
 	}
 }
 
+// TestSend_SuccessStatusWithErrorBody_ReturnsError covers the 2xx branch that
+// consults out.Error — a response whose status line says success while its body
+// names a failure. Without it that branch had no test at all, so the shared
+// providerError() extraction could have been wired into the >=400 path only and
+// the suite would still have gone green while a failed send was recorded as
+// StatusSent with no provider id.
+func TestSend_SuccessStatusWithErrorBody_ReturnsError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"error":{"message":"domain is not verified"}}`))
+	}))
+	defer ts.Close()
+
+	c := newTestResendClient(ts.URL)
+	id, err := c.Send(context.Background(), "secret-key", "from@example.com", "to@example.com", "subj", "html")
+	if err == nil {
+		t.Fatalf("want error for 2xx response carrying an error body, got id=%q", id)
+	}
+	if id != "" {
+		t.Fatalf("want empty provider id on error, got %q", id)
+	}
+	if !strings.Contains(err.Error(), "domain is not verified") {
+		t.Fatalf("want the provider's own message surfaced, got %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "to@example.com") || strings.Contains(err.Error(), "secret-key") {
+		t.Fatalf("error must not leak recipient or api key, got %q", err.Error())
+	}
+}
+
 func TestSend_ErrorResponse_SurfacesProviderMessage(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnprocessableEntity)

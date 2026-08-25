@@ -50,6 +50,33 @@ func newResendSender() Sender {
 
 const resendEndpoint = "https://api.resend.com/emails"
 
+// resendResponse is the subset of Resend's JSON response this client reads.
+// Named rather than declared inline so providerError below can be defined on it
+// once instead of the extraction being retyped per branch.
+type resendResponse struct {
+	Data *struct {
+		ID string `json:"id"`
+	} `json:"data"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+// providerError returns the failure the provider named in its own response
+// body, or nil when the body named none.
+//
+// One definition for both branches that consult it — the >=400 path and the 2xx
+// path. They were two copies of "is out.Error populated, and if so what wording"
+// with only their FALLBACKS differing (a status code vs. the missing-provider-id
+// check), and the fallbacks are what stayed at the call sites. Two copies of one
+// extraction is two things to change when the provider's error shape moves.
+func (r resendResponse) providerError() error {
+	if r.Error == nil || r.Error.Message == "" {
+		return nil
+	}
+	return fmt.Errorf("resend: send failed: %s", r.Error.Message)
+}
+
 func (c *resendClient) Send(ctx context.Context, apiKey, from, to, subject, html string) (string, error) {
 	body, err := json.Marshal(map[string]string{"from": from, "to": to, "subject": subject, "html": html})
 	if err != nil {
@@ -66,22 +93,15 @@ func (c *resendClient) Send(ctx context.Context, apiKey, from, to, subject, html
 		return "", err
 	}
 	defer resp.Body.Close()
-	var out struct {
-		Data *struct {
-			ID string `json:"id"`
-		} `json:"data"`
-		Error *struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
+	var out resendResponse
 	decodeErr := json.NewDecoder(resp.Body).Decode(&out)
 
 	// >=400: prefer the provider's own error message; fall back to the status
 	// code (never the raw body — it may contain recipient data) so production
 	// logs at least say what failed.
 	if resp.StatusCode >= 400 {
-		if out.Error != nil && out.Error.Message != "" {
-			return "", fmt.Errorf("resend: send failed: %s", out.Error.Message)
+		if err := out.providerError(); err != nil {
+			return "", err
 		}
 		return "", fmt.Errorf("resend: send failed: status %d", resp.StatusCode)
 	}
@@ -92,8 +112,10 @@ func (c *resendClient) Send(ctx context.Context, apiKey, from, to, subject, html
 	if decodeErr != nil {
 		return "", fmt.Errorf("resend: send returned malformed response body: %w", decodeErr)
 	}
-	if out.Error != nil && out.Error.Message != "" {
-		return "", fmt.Errorf("resend: send failed: %s", out.Error.Message)
+	// A 2xx carrying an error object is not success either: on this path the
+	// body is the authority, not the status line.
+	if err := out.providerError(); err != nil {
+		return "", err
 	}
 	if out.Data == nil || out.Data.ID == "" {
 		return "", fmt.Errorf("resend: send returned no provider id")
