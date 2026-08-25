@@ -3,6 +3,7 @@ package emailkit
 import (
 	"context"
 	"log/slog"
+	"maps"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -18,6 +19,19 @@ import (
 // serialisation from this package. A *sql.DB-backed implementation satisfies
 // this for free; a map-backed fake in a consumer's tests does not, and needs
 // its own mutex.
+//
+// PII CONTRACT: returned errors MUST NOT embed the recipient address.
+// emailkit logs the error verbatim ("err", err), so an implementation that
+// wraps as fmt.Errorf("suppression lookup %s: %w", email, err) puts the full
+// address into the very log line this package keeps to a bare domain. Wrap
+// with the domain, a row id, or nothing — the audit row written by LogSend is
+// the intended home for the address, under each project's own retention rules.
+// emailkit cannot enforce this: redacting arbitrary error text is not
+// reliable, which is why it is stated here as a contract.
+//
+// Store methods are also called on a goroutine the caller does not wait for.
+// A method that blocks forever leaks that goroutine and stalls Wait; use the
+// supplied ctx (or your driver's own timeout) to bound it.
 type Store interface {
 	// send path
 	IsSuppressed(ctx context.Context, email string) (bool, error)
@@ -65,6 +79,24 @@ type Service struct {
 	reg    Registry
 	client Sender
 	wg     sync.WaitGroup
+
+	// logger is where this Service writes its own diagnostics. Nil means
+	// slog.Default(), resolved per call by log() rather than captured at
+	// construction so a later slog.SetDefault still takes effect. It exists
+	// so tests can capture output by injecting a logger instead of swapping
+	// the process-wide default — global mutation would silently forbid
+	// t.Parallel() in every test in this package.
+	logger *slog.Logger
+}
+
+// log returns the destination for this Service's own diagnostics. See the
+// logger field for why the fallback is resolved here and not in the
+// constructor.
+func (s *Service) log() *slog.Logger {
+	if s.logger != nil {
+		return s.logger
+	}
+	return slog.Default()
 }
 
 // NewService builds a Service on the production provider client. The client is
@@ -84,6 +116,13 @@ func NewService(store Store, cfg Config, reg Registry) *Service {
 // What emailkit does still guarantee is routing — every send through this
 // Service, whichever Sender backs it, passes the suppression check and writes
 // an audit row, because deliver() remains the only caller of Sender.Send.
+//
+// That guarantee covers sends made THROUGH the Service. A consumer that
+// constructs its own Sender still holds that reference and can call Send on it
+// directly, with no suppression check and no audit row; emailkit cannot
+// prevent that. What NewService protects against is obtaining a live provider
+// client FROM this package (see newResendSender) — a consumer's own Sender is
+// a consumer's own discipline.
 func NewServiceWithSender(store Store, cfg Config, reg Registry, s Sender) *Service {
 	return &Service{store: store, cfg: cfg, reg: reg, client: s}
 }
@@ -91,15 +130,27 @@ func NewServiceWithSender(store Store, cfg Config, reg Registry, s Sender) *Serv
 // Send renders key from the Store override (if any) or the Registry, then
 // delivers. Fire-and-forget: an email must never block or fail the HTTP
 // request that triggered it.
+//
+// The render happens on the send goroutine, not here. Resolving the template
+// calls the consumer's Store.Template, and that used to run on the caller's
+// goroutine — so a slow store blocked the HTTP request and a panicking one
+// killed it, both of which contradict the fire-and-forget contract above.
+//
+// vars may be mutated or reused as soon as Send returns: it is copied here,
+// on the CALLER'S goroutine, before the send goroutine can read it. Handing
+// the caller's own map to a goroutine nobody waits for would be a genuine data
+// race — the caller's next write and the render's read are unordered.
 func (s *Service) Send(ctx context.Context, key, to string, vars map[string]string) {
-	subject, html := s.render(ctx, key, vars)
-	s.fire(ctx, to, subject, html, key)
+	snapshot := maps.Clone(vars) // nil stays nil; render treats it as no vars
+	s.fire(ctx, to, key, func(ctx context.Context) (string, string) {
+		return s.render(ctx, key, snapshot)
+	})
 }
 
 // SendRaw delivers a pre-rendered subject and body through the identical
 // suppression → creds → send → log path. Used by callers with no template.
 func (s *Service) SendRaw(ctx context.Context, to, subject, html, label string) {
-	s.fire(ctx, to, subject, html, label)
+	s.fire(ctx, to, label, func(context.Context) (string, string) { return subject, html })
 }
 
 // Wait blocks until in-flight sends finish. Test-only in practice, but
@@ -124,21 +175,34 @@ func (s *Service) render(ctx context.Context, key string, vars map[string]string
 	return s.reg.Render(key, vars)
 }
 
-func (s *Service) fire(ctx context.Context, to, subject, html, label string) {
+// fire runs one whole send on its own goroutine. render is a function rather
+// than an already-rendered pair so that template resolution — which calls
+// consumer code — happens inside this goroutine's recover(), off the caller's
+// request goroutine.
+func (s *Service) fire(ctx context.Context, to, label string, render func(context.Context) (string, string)) {
 	s.wg.Add(1)
 	go func() {
+		// DEFER ORDER IS LOAD-BEARING: wg.Done is registered FIRST, so LIFO
+		// runs it LAST — after the recover-and-log below. Wait() therefore
+		// cannot return until the panic line has been written, which is what
+		// lets the panic test read the log buffer right after Wait(). Swap
+		// these two lines and that test goes flaky.
 		defer s.wg.Done()
 		// An email must never panic the caller's request — but a swallowed
 		// panic left zero trace: no log, no stack, no audit row, the mail
 		// simply vanished. Contain it AND record it.
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Error("email send panicked",
+				s.log().Error("email send panicked",
 					"label", label, "domain", domainOf(to),
 					"panic", r, "stack", string(debug.Stack()))
 			}
 		}()
-		s.deliver(context.WithoutCancel(ctx), to, subject, html, label)
+		// WithoutCancel: the request that triggered the mail may return (and
+		// cancel its ctx) long before the send finishes.
+		sendCtx := context.WithoutCancel(ctx)
+		subject, html := render(sendCtx)
+		s.deliver(sendCtx, to, subject, html, label)
 	}()
 }
 
@@ -153,17 +217,17 @@ func (s *Service) deliver(ctx context.Context, to, subject, html, label string) 
 	// hit is not.
 	sup, err := s.store.IsSuppressed(ctx, strings.ToLower(to))
 	if err != nil {
-		slog.Warn("suppression lookup failed; withholding send",
+		s.log().Warn("suppression lookup failed; withholding send",
 			"label", label, "domain", domainOf(to), "err", err)
-		s.log(ctx, to, subject, label, StatusSkipped, nil, strp(reasonSuppressionLookup))
+		s.audit(ctx, to, subject, label, StatusSkipped, nil, strp(reasonSuppressionLookup))
 		return
 	}
 	if sup {
-		s.log(ctx, to, subject, label, StatusSuppressed, nil, strp(reasonSuppressed))
+		s.audit(ctx, to, subject, label, StatusSuppressed, nil, strp(reasonSuppressed))
 		return
 	}
 	if s.cfg.APIKey == "" {
-		s.log(ctx, to, subject, label, StatusSkipped, nil, strp(reasonNotConfigured))
+		s.audit(ctx, to, subject, label, StatusSkipped, nil, strp(reasonNotConfigured))
 		return
 	}
 	id, err := s.client.Send(ctx, s.cfg.APIKey, s.cfg.From, to, subject, html)
@@ -172,29 +236,41 @@ func (s *Service) deliver(ctx context.Context, to, subject, html, label string) 
 		// PII and the audit row already holds it under the project's own
 		// retention rules; repeating it in application logs spreads it to a
 		// second lifetime nobody manages.
-		slog.Warn("email send failed", "label", label, "domain", domainOf(to), "err", err)
-		s.log(ctx, to, subject, label, StatusFailed, nil, strp(err.Error()))
+		//
+		// Scope of that guarantee, stated exactly: emailkit never puts the
+		// address into a field it controls. It cannot vouch for "err" — that
+		// text comes from a Store or Sender implementation, and redacting
+		// arbitrary error strings is not reliable. Keeping the address out of
+		// those errors is the implementation's contract; see Store.
+		s.log().Warn("email send failed", "label", label, "domain", domainOf(to), "err", err)
+		s.audit(ctx, to, subject, label, StatusFailed, nil, strp(err.Error()))
 		return
 	}
-	s.log(ctx, to, subject, label, StatusSent, strpOrNil(id), nil)
+	s.audit(ctx, to, subject, label, StatusSent, strpOrNil(id), nil)
 }
 
-// log writes the audit row. A failure here is not recoverable at this point —
+// audit writes the audit row. A failure here is not recoverable at this point —
 // the mail decision has already been taken — but it must not be silent: this
 // row is the only retained record of the recipient, so a store that has
 // stopped accepting writes would otherwise lose every send trace invisibly.
-func (s *Service) log(ctx context.Context, to, subject, label, status string, providerID, errMsg *string) {
+func (s *Service) audit(ctx context.Context, to, subject, label, status string, providerID, errMsg *string) {
 	if err := s.store.LogSend(ctx, SendRecord{
 		To: to, Type: label, Subject: subject, Status: status,
 		ProviderID: providerID, Error: errMsg,
 	}); err != nil {
-		slog.Error("email audit write failed",
+		s.log().Error("email audit write failed",
 			"label", label, "domain", domainOf(to), "status", status, "err", err)
 	}
 }
 
+// domainOf reduces an address to the part safe to log. A malformed address
+// yields "invalid" rather than the empty string: an empty domain= field is
+// indistinguishable from a missing one and tells an operator nothing, whereas
+// "invalid" says plainly that the address never had a domain to begin with.
+// Both malformed shapes — no '@' at all, and a trailing '@' with nothing after
+// it — therefore report the same thing.
 func domainOf(addr string) string {
-	if i := strings.LastIndexByte(addr, '@'); i >= 0 {
+	if i := strings.LastIndexByte(addr, '@'); i >= 0 && i+1 < len(addr) {
 		return addr[i+1:]
 	}
 	return "invalid"

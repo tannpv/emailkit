@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeStore honours the Store concurrency contract with a mutex, so the -race
@@ -93,19 +94,24 @@ func (s *fakeSvcSender) seen() (int, string, string, string) {
 	return s.calls, s.to, s.subject, s.html
 }
 
-func newTestService(st *fakeStore, sn *fakeSvcSender, key string) *Service {
+// newTestService takes a Store, not a *fakeStore, so the panicking and
+// blocking doubles below reuse it instead of open-coding a constructor each.
+func newTestService(st Store, sn *fakeSvcSender, key string) *Service {
 	return NewServiceWithSender(st, Config{APIKey: key, From: "T <t@example.com>"},
 		Registry{"k": {Subject: "registry-subject", Body: "registry-body"}}, sn)
 }
 
-// captureLogs installs a buffer-backed default logger for the duration of one
-// test and restores the previous one afterwards.
-func captureLogs(t *testing.T) *bytes.Buffer {
+// captureLogs points one Service at a buffer-backed logger and returns the
+// buffer. It injects rather than calling slog.SetDefault: the process-wide
+// default is shared state, and mutating it would make every test in this
+// package silently incompatible with t.Parallel().
+//
+// Read the buffer only after svc.Wait(): sends log from their own goroutine,
+// and Wait is the happens-before edge that makes those writes visible.
+func captureLogs(t *testing.T, svc *Service) *bytes.Buffer {
 	t.Helper()
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	svc.logger = slog.New(slog.NewTextHandler(&buf, nil))
 	return &buf
 }
 
@@ -152,10 +158,10 @@ func TestDeliver_SuppressionLookupIsCaseInsensitive(t *testing.T) {
 // TestDeliver_SuppressionLookupErrorWithholdsSend is the Fix 2 regression: an
 // errored lookup used to fall through and send.
 func TestDeliver_SuppressionLookupErrorWithholdsSend(t *testing.T) {
-	buf := captureLogs(t)
 	st := &fakeStore{supErr: errors.New("db connection refused")}
 	sn := &fakeSvcSender{}
 	svc := newTestService(st, sn, "key")
+	buf := captureLogs(t, svc)
 	svc.Send(context.Background(), "k", "user@example.com", nil)
 	svc.Wait()
 
@@ -190,8 +196,24 @@ func TestDeliver_NoKeySkips(t *testing.T) {
 	if logs[0].Error == nil || *logs[0].Error != reasonNotConfigured {
 		t.Fatalf("want the not-configured reason, got %v", logs[0].Error)
 	}
-	if strings.Contains(*logs[0].Error, "Resend") {
-		t.Fatal("reason must be provider-neutral — Sender is the SES/Postmark seam")
+}
+
+// TestReasons_AreProviderNeutral guards the constants themselves. It used to be
+// a strings.Contains on the value the previous test had just asserted equal to
+// reasonNotConfigured, so it could only fire if someone edited the constant —
+// which is precisely the change worth catching, and it belongs here where it
+// covers all three reasons independently of any send path.
+//
+// Sender is explicitly the seam for SES or Postmark, so a reason naming a
+// provider is wrong the moment a consumer supplies its own implementation.
+func TestReasons_AreProviderNeutral(t *testing.T) {
+	providers := []string{"Resend", "SES", "Postmark", "SendGrid", "Mailgun"}
+	for _, reason := range []string{reasonNotConfigured, reasonSuppressed, reasonSuppressionLookup} {
+		for _, p := range providers {
+			if strings.Contains(strings.ToLower(reason), strings.ToLower(p)) {
+				t.Fatalf("reason %q names provider %q — reasons must be provider-neutral", reason, p)
+			}
+		}
 	}
 }
 
@@ -309,9 +331,16 @@ func TestSendRaw_SuppressedNeverSends(t *testing.T) {
 	}
 }
 
-// TestLogging_UsesDomainOnlyNotFullAddress pins the PII guarantee: the audit
-// row holds the address under the project's retention rules, application logs
-// must not give it a second, unmanaged lifetime.
+// TestLogging_UsesDomainOnlyNotFullAddress pins the PII guarantee that emailkit
+// can actually keep: no field emailkit controls carries the address. The audit
+// row holds it under the project's retention rules; application logs must not
+// give it a second, unmanaged lifetime.
+//
+// Deliberately NOT pinned here: the "err" value. That text comes from a Store
+// or Sender the consumer wrote, and emailkit logs it verbatim — keeping the
+// address out of it is the implementation's contract (see Store), not
+// something this package can enforce. The fixtures below honour that contract,
+// which is why the assertion below holds.
 func TestLogging_UsesDomainOnlyNotFullAddress(t *testing.T) {
 	const addr = "secret.user@example.com"
 
@@ -326,8 +355,8 @@ func TestLogging_UsesDomainOnlyNotFullAddress(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := captureLogs(t)
 			svc := newTestService(tc.store, tc.send, "key")
+			buf := captureLogs(t, svc)
 			svc.Send(context.Background(), "k", addr, nil)
 			svc.Wait()
 
@@ -348,9 +377,9 @@ func TestLogging_UsesDomainOnlyNotFullAddress(t *testing.T) {
 // TestFire_PanicIsContainedAndLogged pins Fix 3: the panic must not escape into
 // the caller's request, and must not vanish without a trace either.
 func TestFire_PanicIsContainedAndLogged(t *testing.T) {
-	buf := captureLogs(t)
 	st := &panicStore{}
 	svc := NewServiceWithSender(st, Config{APIKey: "key"}, Registry{}, &fakeSvcSender{})
+	buf := captureLogs(t, svc)
 	svc.SendRaw(context.Background(), "boom@example.com", "s", "h", "lbl")
 	svc.Wait() // must return: the panic was contained, not propagated
 
@@ -373,6 +402,141 @@ type panicStore struct{ fakeStore }
 
 func (p *panicStore) IsSuppressed(context.Context, string) (bool, error) {
 	panic("store exploded")
+}
+
+// templateStore controls the timing and failure mode of Store.Template — the
+// one piece of consumer code the templated send path runs before deliver().
+// entered/release make "Template is executing right now" an assertable state
+// rather than a guess; everything else comes from the embedded fakeStore.
+type templateStore struct {
+	fakeStore
+	entered chan struct{} // closed on entry when non-nil
+	release chan struct{} // Template parks until this is closed, when non-nil
+	delay   time.Duration // unsynchronised pause; see TestSend_CopiesVars...
+	explode bool
+}
+
+func (t *templateStore) Template(ctx context.Context, key string) (string, string, bool) {
+	if t.entered != nil {
+		close(t.entered)
+	}
+	if t.explode {
+		panic("template exploded")
+	}
+	if t.release != nil {
+		<-t.release
+	}
+	if t.delay > 0 {
+		time.Sleep(t.delay)
+	}
+	return t.fakeStore.Template(ctx, key)
+}
+
+// sendReturnTimeout bounds "Send returned promptly". Generous on purpose: a
+// loaded CI box being slow to schedule a goroutine is not the failure under
+// test, a Send that never returns is.
+const sendReturnTimeout = 2 * time.Second
+
+// TestSend_TemplatePanicIsContainedAndLogged is the templated path's half of
+// the fire-and-forget contract. render() used to run on the CALLER'S goroutine,
+// so a panicking Store.Template took down the HTTP request that triggered the
+// mail; fire()'s recover() only ever covered deliver(). This test has no
+// recover() of its own by design — if the panic escapes, the test binary dies,
+// which is exactly the production symptom.
+func TestSend_TemplatePanicIsContainedAndLogged(t *testing.T) {
+	st := &templateStore{explode: true}
+	sn := &fakeSvcSender{}
+	svc := newTestService(st, sn, "key")
+	buf := captureLogs(t, svc)
+
+	svc.Send(context.Background(), "k", "boom@example.com", nil)
+	svc.Wait()
+
+	out := buf.String()
+	if !strings.Contains(out, "email send panicked") {
+		t.Fatalf("want the recovered render panic logged, got %q", out)
+	}
+	if !strings.Contains(out, "template exploded") {
+		t.Fatalf("want the panic value logged, got %q", out)
+	}
+	if !strings.Contains(out, "domain=example.com") {
+		t.Fatalf("want the domain logged, got %q", out)
+	}
+	if strings.Contains(out, "boom@example.com") {
+		t.Fatalf("panic log must carry the domain only, got %q", out)
+	}
+	if calls, _, _, _ := sn.seen(); calls != 0 {
+		t.Fatal("a render that panicked must not reach the sender")
+	}
+}
+
+// TestSend_BlockingTemplateDoesNotBlockSend is the other half: a Store.Template
+// that is slow (or hung on a database) must not hold the caller's request open.
+// With the render back on the caller's goroutine this deadlocks until the
+// timeout below fires.
+func TestSend_BlockingTemplateDoesNotBlockSend(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	// Cleanup rather than a timeout inside the store: if an assertion below
+	// fails, this still frees the parked send goroutine.
+	t.Cleanup(unblock)
+
+	st := &templateStore{entered: entered, release: release}
+	sn := &fakeSvcSender{id: "prov-1"}
+	svc := newTestService(st, sn, "key")
+
+	returned := make(chan struct{})
+	go func() {
+		svc.Send(context.Background(), "k", "a@b.c", nil)
+		close(returned)
+	}()
+
+	<-entered // Store.Template is now executing and parked on release
+	select {
+	case <-returned:
+	case <-time.After(sendReturnTimeout):
+		t.Fatal("Send did not return while Store.Template was blocked — the render is on the caller's goroutine")
+	}
+
+	unblock()
+	svc.Wait()
+	if calls, _, _, _ := sn.seen(); calls != 1 {
+		t.Fatalf("the send must still complete once the store answers, got %d calls", calls)
+	}
+}
+
+// varsRenderDelay holds the render open long enough that a non-copying
+// implementation would substitute the caller's MUTATED value. It is a delay,
+// not a synchroniser: introducing a happens-before edge here (channel, mutex)
+// would order the caller's write ahead of the goroutine's read and hide the
+// very race -race exists to catch.
+const varsRenderDelay = 20 * time.Millisecond
+
+// TestSend_CopiesVarsSoCallerCanReuseTheMap pins the copy in Send. Moving the
+// render onto the send goroutine handed it a map the caller still owns, so
+// without the copy the caller's next write races the substitution. Two
+// failures are pinned at once: the wrong rendered value (assertions below) and
+// the data race itself (under -race).
+func TestSend_CopiesVarsSoCallerCanReuseTheMap(t *testing.T) {
+	const original, mutated = "original", "mutated"
+	st := &templateStore{delay: varsRenderDelay}
+	sn := &fakeSvcSender{id: "prov-1"}
+	svc := NewServiceWithSender(st, Config{APIKey: "key", From: "T <t@example.com>"},
+		Registry{"k": {Subject: "hello {{name}}", Body: "<p>{{name}}</p>"}}, sn)
+
+	vars := map[string]string{"name": original}
+	svc.Send(context.Background(), "k", "a@b.c", vars)
+	vars["name"] = mutated // the caller owns this map and may reuse it at once
+
+	svc.Wait()
+	_, _, subject, html := sn.seen()
+	if subject != "hello "+original {
+		t.Fatalf("subject must render the value vars held when Send was called, got %q", subject)
+	}
+	if html != "<p>"+original+"</p>" {
+		t.Fatalf("body must render the value vars held when Send was called, got %q", html)
+	}
 }
 
 func TestDeliver_SendFailLogsFailed(t *testing.T) {
@@ -406,7 +570,10 @@ func TestDomainOf(t *testing.T) {
 		{"a@b@example.com", "example.com"}, // last @ wins
 		{"no-at-sign", "invalid"},          // must not panic or index out of range
 		{"", "invalid"},
-		{"trailing@", ""},
+		// A trailing '@' is as malformed as no '@' at all and reports the
+		// same way. It used to yield "", which logged a bare `domain=` an
+		// operator cannot distinguish from a field that was never set.
+		{"trailing@", "invalid"},
 	} {
 		if got := domainOf(tc.in); got != tc.want {
 			t.Fatalf("domainOf(%q) = %q, want %q", tc.in, got, tc.want)
