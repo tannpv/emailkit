@@ -10,3 +10,17 @@ jobs:
           go-version: '1.25'
       - run: go vet ./...
       - run: go test ./... -race -count=1
+      - name: Fail if a dependency was added
+        run: |
+          # "Zero non-stdlib dependencies" is a Global Constraint. go vet and
+          # go test pass fine after a go get, so without this the constraint is
+          # a convention nobody enforces.
+          if grep -qE '^\s*require' go.mod; then
+            echo "::error::emailkit must stay dependency-free; go.mod has a require block."
+            exit 1
+          fi
+          if [ -f go.sum ]; then
+            echo "::error::go.sum exists — a dependency was added."
+            exit 1
+          fi
+          echo "ok — no dependencies"
