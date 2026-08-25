@@ -94,9 +94,10 @@ func (s *fakeSvcSender) seen() (int, string, string, string) {
 	return s.calls, s.to, s.subject, s.html
 }
 
-// newTestService takes a Store, not a *fakeStore, so the panicking and
-// blocking doubles below reuse it instead of open-coding a constructor each.
-func newTestService(st Store, sn *fakeSvcSender, key string) *Service {
+// newTestService takes the two ports, not the concrete fakes, so every double
+// below (panicking store, blocking store, context-aware pair) reuses it instead
+// of open-coding a constructor each.
+func newTestService(st Store, sn Sender, key string) *Service {
 	return NewServiceWithSender(st, Config{APIKey: key, From: "T <t@example.com>"},
 		Registry{"k": {Subject: "registry-subject", Body: "registry-body"}}, sn)
 }
@@ -208,7 +209,11 @@ func TestDeliver_NoKeySkips(t *testing.T) {
 // provider is wrong the moment a consumer supplies its own implementation.
 func TestReasons_AreProviderNeutral(t *testing.T) {
 	providers := []string{"Resend", "SES", "Postmark", "SendGrid", "Mailgun"}
-	for _, reason := range []string{reasonNotConfigured, reasonSuppressed, reasonSuppressionLookup} {
+	reasons := []string{
+		reasonNotConfigured, reasonSuppressed, reasonSuppressionLookup,
+		reasonNothingToSend, reasonPanicked,
+	}
+	for _, reason := range reasons {
 		for _, p := range providers {
 			if strings.Contains(strings.ToLower(reason), strings.ToLower(p)) {
 				t.Fatalf("reason %q names provider %q — reasons must be provider-neutral", reason, p)
@@ -331,6 +336,177 @@ func TestSendRaw_SuppressedNeverSends(t *testing.T) {
 	}
 }
 
+// TestSend_UnknownKeyIsNothingToSend pins the contract Registry.Render
+// documents: an unknown key means "nothing to send". deliver used to ignore
+// that and hand the provider two empty strings, so a typo'd key mailed a blank
+// email and the audit row recorded it as StatusSent.
+func TestSend_UnknownKeyIsNothingToSend(t *testing.T) {
+	st := &fakeStore{} // no override, so Template reports !ok
+	sn := &fakeSvcSender{}
+	svc := newTestService(st, sn, "key") // its Registry holds "k" and nothing else
+	svc.Send(context.Background(), "no-such-key", "a@b.c", nil)
+	svc.Wait()
+
+	if calls, _, _, _ := sn.seen(); calls != 0 {
+		t.Fatal("a key in neither the store nor the registry must not reach the sender — that mails a blank email")
+	}
+	logs, _ := st.snapshot()
+	if len(logs) != 1 {
+		t.Fatalf("want exactly one audit row, got %+v", logs)
+	}
+	if logs[0].Status != StatusSkipped {
+		t.Fatalf("want %q, got %q — a blank email must never be recorded as sent", StatusSkipped, logs[0].Status)
+	}
+	if logs[0].Error == nil || *logs[0].Error != reasonNothingToSend {
+		t.Fatalf("skip reason must name the empty render, got %v", logs[0].Error)
+	}
+	if logs[0].Type != "no-such-key" {
+		t.Fatalf("audit row must name the key that could not be resolved, got %q", logs[0].Type)
+	}
+}
+
+// TestSend_OnlyBothEmptyIsNothingToSend pins the width of the rule above. A
+// subject with no body is a real email — "your export is ready" with the whole
+// message in the subject line — and withholding it would be a worse bug than
+// the one being fixed.
+func TestSend_OnlyBothEmptyIsNothingToSend(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		def        TemplateDef
+		wantSends  int
+		wantStatus string
+	}{
+		{"subject only", TemplateDef{Subject: "subject-only"}, 1, StatusSent},
+		{"body only", TemplateDef{Body: "<p>body-only</p>"}, 1, StatusSent},
+		{"both empty", TemplateDef{}, 0, StatusSkipped},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &fakeStore{}
+			sn := &fakeSvcSender{id: "prov-1"}
+			svc := NewServiceWithSender(st, Config{APIKey: "key", From: "T <t@example.com>"},
+				Registry{"k": tc.def}, sn)
+			svc.Send(context.Background(), "k", "a@b.c", nil)
+			svc.Wait()
+
+			if calls, _, _, _ := sn.seen(); calls != tc.wantSends {
+				t.Fatalf("want %d sends, got %d", tc.wantSends, calls)
+			}
+			logs, _ := st.snapshot()
+			if len(logs) != 1 || logs[0].Status != tc.wantStatus {
+				t.Fatalf("want one %q row, got %+v", tc.wantStatus, logs)
+			}
+		})
+	}
+}
+
+// TestSendRaw_NothingToSendAppliesToRawToo states the deliberate decision that
+// the rule lives at the chokepoint and therefore covers SendRaw. The CAUSE
+// differs — a caller's own bug, not an unresolvable key — but the OUTCOME is
+// the same blank email, and the outcome is what the recipient gets.
+func TestSendRaw_NothingToSendAppliesToRawToo(t *testing.T) {
+	for _, tc := range []struct {
+		name, subject, html string
+		wantSends           int
+		wantStatus          string
+	}{
+		{"both empty", "", "", 0, StatusSkipped},
+		{"subject only", "raw-subject", "", 1, StatusSent},
+		{"body only", "", "<p>raw</p>", 1, StatusSent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &fakeStore{}
+			sn := &fakeSvcSender{id: "prov-raw"}
+			svc := newTestService(st, sn, "key")
+			svc.SendRaw(context.Background(), "raw@example.com", tc.subject, tc.html, "raw-label")
+			svc.Wait()
+
+			if calls, _, _, _ := sn.seen(); calls != tc.wantSends {
+				t.Fatalf("want %d sends, got %d", tc.wantSends, calls)
+			}
+			logs, _ := st.snapshot()
+			if len(logs) != 1 || logs[0].Status != tc.wantStatus {
+				t.Fatalf("want one %q row, got %+v", tc.wantStatus, logs)
+			}
+			if tc.wantStatus == StatusSkipped &&
+				(logs[0].Error == nil || *logs[0].Error != reasonNothingToSend) {
+				t.Fatalf("skip reason must name the empty pair, got %v", logs[0].Error)
+			}
+		})
+	}
+}
+
+// ctxAwareStore behaves the way a real *sql.DB-backed Store does: every call
+// fails fast on a context that is already cancelled. The plain fakeStore
+// ignores ctx entirely, which is why the whole suite stayed green with
+// context.WithoutCancel removed — nothing was watching.
+type ctxAwareStore struct{ fakeStore }
+
+func (c *ctxAwareStore) IsSuppressed(ctx context.Context, email string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	return c.fakeStore.IsSuppressed(ctx, email)
+}
+
+func (c *ctxAwareStore) LogSend(ctx context.Context, r SendRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err // a cancelled context writes no audit row
+	}
+	return c.fakeStore.LogSend(ctx, r)
+}
+
+// ctxAwareSender records the call before consulting ctx, so the fake observes
+// the attempt either way and the assertions can tell "never reached" apart
+// from "reached with a dead context".
+type ctxAwareSender struct{ fakeSvcSender }
+
+func (c *ctxAwareSender) Send(ctx context.Context, key, from, to, subject, html string) (string, error) {
+	id, err := c.fakeSvcSender.Send(ctx, key, from, to, subject, html)
+	if cerr := ctx.Err(); cerr != nil {
+		return "", cerr
+	}
+	return id, err
+}
+
+// TestFire_SendSurvivesCallerContextCancellation pins the one line the
+// fire-and-forget design rests on: context.WithoutCancel in fire(). The HTTP
+// request that triggered the mail routinely returns — and cancels its ctx —
+// before the send goroutine gets scheduled. Passing that ctx straight through
+// means the store lookup, the provider call and the audit write all fail with
+// context.Canceled and the mail silently never happens.
+//
+// The context here is cancelled BEFORE Send is even called, which is the
+// worst case and removes any scheduling race from the test.
+func TestFire_SendSurvivesCallerContextCancellation(t *testing.T) {
+	st := &ctxAwareStore{}
+	sn := &ctxAwareSender{fakeSvcSender{id: "prov-1"}}
+	svc := newTestService(st, sn, "key")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	svc.Send(ctx, "k", "a@b.c", nil)
+	svc.Wait()
+
+	calls, to, subject, _ := sn.seen()
+	if calls != 1 {
+		t.Fatalf("want 1 send after the caller's context was cancelled, got %d — fire() must detach the context", calls)
+	}
+	if to != "a@b.c" || subject != "registry-subject" {
+		t.Fatalf("the detached send must carry the same arguments, got %q %q", to, subject)
+	}
+	logs, queried := st.snapshot()
+	if len(queried) != 1 {
+		t.Fatalf("the suppression lookup must still run on a live context, queried %q", queried)
+	}
+	if len(logs) != 1 || logs[0].Status != StatusSent {
+		t.Fatalf("want one sent audit row written on a live context, got %+v", logs)
+	}
+	if logs[0].ProviderID == nil || *logs[0].ProviderID != "prov-1" {
+		t.Fatalf("provider id must survive too, got %v", logs[0].ProviderID)
+	}
+}
+
 // TestLogging_UsesDomainOnlyNotFullAddress pins the PII guarantee that emailkit
 // can actually keep: no field emailkit controls carries the address. The audit
 // row holds it under the project's retention rules; application logs must not
@@ -395,6 +571,21 @@ func TestFire_PanicIsContainedAndLogged(t *testing.T) {
 	}
 	if strings.Contains(out, "boom@example.com") {
 		t.Fatalf("panic log must carry the domain only, got %q", out)
+	}
+
+	// fire()'s comment promises "contain it AND record it": a log line alone
+	// is only seen by someone already looking, so the mail must leave a row.
+	logs, _ := st.snapshot()
+	if len(logs) != 1 || logs[0].Status != StatusFailed {
+		t.Fatalf("want one failed audit row for the panicked send, got %+v", logs)
+	}
+	if logs[0].Error == nil || *logs[0].Error != reasonPanicked {
+		t.Fatalf("audit reason must name the panic, got %v", logs[0].Error)
+	}
+	// The recovered value is consumer text and may embed the address; it
+	// belongs in the log line (with its stack), not in a second copy on the row.
+	if strings.Contains(*logs[0].Error, "store exploded") {
+		t.Fatalf("audit row must not carry the recovered value, got %q", *logs[0].Error)
 	}
 }
 
@@ -467,6 +658,15 @@ func TestSend_TemplatePanicIsContainedAndLogged(t *testing.T) {
 	}
 	if calls, _, _, _ := sn.seen(); calls != 0 {
 		t.Fatal("a render that panicked must not reach the sender")
+	}
+	logs, _ := st.snapshot()
+	if len(logs) != 1 || logs[0].Status != StatusFailed {
+		t.Fatalf("want one failed audit row for the panicked render, got %+v", logs)
+	}
+	// Nothing rendered, so there is no subject to record. An honestly blank
+	// field beats an invented one.
+	if logs[0].Subject != "" {
+		t.Fatalf("a panicked render has no subject to record, got %q", logs[0].Subject)
 	}
 }
 

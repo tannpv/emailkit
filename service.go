@@ -69,6 +69,8 @@ const (
 	reasonNotConfigured     = "Email provider not configured (no API key)"
 	reasonSuppressed        = "Recipient on suppression list (bounce/complaint)"
 	reasonSuppressionLookup = "Suppression lookup failed; send withheld"
+	reasonNothingToSend     = "Empty subject and body; nothing to send"
+	reasonPanicked          = "Send panicked; see application logs"
 )
 
 // Service is the only way to send. wg tracks in-flight sends so tests can
@@ -185,9 +187,14 @@ func (s *Service) fire(ctx context.Context, to, label string, render func(contex
 		// DEFER ORDER IS LOAD-BEARING: wg.Done is registered FIRST, so LIFO
 		// runs it LAST — after the recover-and-log below. Wait() therefore
 		// cannot return until the panic line has been written, which is what
-		// lets the panic test read the log buffer right after Wait(). Swap
-		// these two lines and that test goes flaky.
+		// lets the panic test read the log buffer right after Wait(). Register
+		// it after the recover below instead and that test goes flaky.
 		defer s.wg.Done()
+		// WithoutCancel: the request that triggered the mail may return (and
+		// cancel its ctx) long before the send finishes. Resolved before the
+		// recover below so the panic path has a live context to audit on —
+		// the caller's may already be cancelled, which is the whole point.
+		sendCtx := context.WithoutCancel(ctx)
 		// An email must never panic the caller's request — but a swallowed
 		// panic left zero trace: no log, no stack, no audit row, the mail
 		// simply vanished. Contain it AND record it.
@@ -196,11 +203,9 @@ func (s *Service) fire(ctx context.Context, to, label string, render func(contex
 				s.log().Error("email send panicked",
 					"label", label, "domain", domainOf(to),
 					"panic", r, "stack", string(debug.Stack()))
+				s.auditPanic(sendCtx, to, label)
 			}
 		}()
-		// WithoutCancel: the request that triggered the mail may return (and
-		// cancel its ctx) long before the send finishes.
-		sendCtx := context.WithoutCancel(ctx)
 		subject, html := render(sendCtx)
 		s.deliver(sendCtx, to, subject, html, label)
 	}()
@@ -210,6 +215,25 @@ func (s *Service) fire(ctx context.Context, to, label string, render func(contex
 // s.client.Send — see chokepoint_test.go. Every send therefore passes the
 // suppression check by construction rather than by convention.
 func (s *Service) deliver(ctx context.Context, to, subject, html, label string) {
+	// Registry.Render documents an unknown key as "nothing to send" by
+	// returning two empty strings; deliver used to ignore that and hand the
+	// pair to the provider, so a typo'd key mailed a blank email and the audit
+	// row said StatusSent. Honour the documented contract here.
+	//
+	// BOTH empty, not either: a subject with an empty body is a real (if
+	// terse) email — a "your export is ready" notification with everything in
+	// the subject line is legitimate — and an empty subject with a body is a
+	// caller's formatting choice, not an unresolvable template.
+	//
+	// This is deliberately at the chokepoint rather than in Send, so it covers
+	// SendRaw too. A SendRaw caller passing both fields empty is a different
+	// CAUSE (its own bug rather than a bad key) but the same OUTCOME — a blank
+	// email — and the outcome is what the recipient and the audit row see. One
+	// rule here beats one copy per entry point.
+	if subject == "" && html == "" {
+		s.audit(ctx, to, subject, label, StatusSkipped, nil, strp(reasonNothingToSend))
+		return
+	}
 	// Fail CLOSED on a lookup error. Treating an errored lookup as "not
 	// suppressed" meant one database blip mailed every hard-bounced address
 	// on the list — the exact outcome suppression exists to prevent. A
@@ -247,6 +271,32 @@ func (s *Service) deliver(ctx context.Context, to, subject, html, label string) 
 		return
 	}
 	s.audit(ctx, to, subject, label, StatusSent, strpOrNil(id), nil)
+}
+
+// auditPanic records a recovered panic in the audit trail, so the mail leaves a
+// row rather than only a log line an operator has to already be looking at.
+//
+// The recovered value is NOT written to the row: it comes from consumer code
+// and can embed the recipient address (a Store panicking inside a formatted
+// message is the obvious way), and the row's Error column is not the place to
+// give that a second copy. The full value with its stack is in the log line
+// this is called from; the row names the cause and points there.
+//
+// Subject is empty because there may not be one: a panic in Store.Template
+// means nothing was ever rendered, and inventing a subject would be worse than
+// an honestly blank field.
+//
+// The write is wrapped in its own recover: a Store that panicked once may well
+// panic again here, and a panic raised inside a deferred recover takes the
+// whole process down — the exact outcome fire() exists to prevent.
+func (s *Service) auditPanic(ctx context.Context, to, label string) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.log().Error("email panic audit write panicked",
+				"label", label, "domain", domainOf(to))
+		}
+	}()
+	s.audit(ctx, to, "", label, StatusFailed, nil, strp(reasonPanicked))
 }
 
 // audit writes the audit row. A failure here is not recoverable at this point —
