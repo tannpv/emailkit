@@ -29,7 +29,20 @@ type fakeStore struct {
 	logErr  error
 	tmpl    *TemplateDef
 	tmplKey string
+
+	// marks + suppress record the webhook path (webhook_test.go). They live on
+	// the one fake rather than a second webhook-only fake, because Store is a
+	// single port and two fakes would be two things to keep in step with it.
+	marks    []markCall
+	suppress []suppressCall
 }
+
+// markCall + suppressCall capture what the webhook handler asked the port to do.
+type markCall struct {
+	id, status string
+	reason     *string
+}
+type suppressCall struct{ email, reason string }
 
 func (f *fakeStore) IsSuppressed(_ context.Context, email string) (bool, error) {
 	f.mu.Lock()
@@ -58,8 +71,19 @@ func (f *fakeStore) Template(_ context.Context, key string) (string, string, boo
 	return f.tmpl.Subject, f.tmpl.Body, true
 }
 
-func (f *fakeStore) MarkByProviderID(context.Context, string, string, *string) error { return nil }
-func (f *fakeStore) Suppress(context.Context, string, string) error                  { return nil }
+func (f *fakeStore) MarkByProviderID(_ context.Context, providerID, status string, reason *string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.marks = append(f.marks, markCall{id: providerID, status: status, reason: reason})
+	return nil
+}
+
+func (f *fakeStore) Suppress(_ context.Context, email, reason string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.suppress = append(f.suppress, suppressCall{email: email, reason: reason})
+	return nil
+}
 
 func (f *fakeStore) snapshot() ([]SendRecord, []string) {
 	f.mu.Lock()
