@@ -312,6 +312,15 @@ const panicUnprintable = "(unprintable panic value: formatting it panicked)"
 //
 // The value recovered below is deliberately NOT formatted or logged: formatting
 // it is precisely what just failed.
+//
+// HONEST LIMIT: this recover() only catches a panic raised BY formatting r.
+// It cannot protect against a String()/Error()/MarshalText() that recurses
+// infinitely (the goroutine's stack simply exhausts) or one that triggers a
+// runtime fatal error such as a concurrent map write. Both are fatal errors
+// the runtime raises outside normal panic/recover, and no recover in this
+// package — here or anywhere else — can catch them; the process still dies.
+// Stated plainly rather than left for the surrounding code to imply full
+// protection.
 func panicText(r any) (text string) {
 	defer func() {
 		if recover() != nil {
