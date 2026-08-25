@@ -70,6 +70,17 @@ type Store interface {
 	// right answer given this property.
 	MarkByProviderID(ctx context.Context, providerID, status string, reason *string) error
 	Suppress(ctx context.Context, email, reason string) error
+
+	// WRITING SUPPRESSION ROWS FROM YOUR OWN CODE: the guarantee above covers
+	// only addresses emailkit hands you — it has already lowercased and trimmed
+	// those. Anything your project inserts itself (an admin unsubscribe form, a
+	// complaint import, a manual block) is outside that path and must apply the
+	// same lowercase-and-trim BEFORE storing.
+	//
+	// Skipping it reproduces, one layer out, the bug this contract exists to
+	// prevent: a row stored as "User@Example.com" is never matched by the
+	// lookup, which queries "user@example.com". The address stays mailable, and
+	// nothing anywhere reports a problem — the suppression simply has no effect.
 }
 
 // SendRecord is the audit row. A thin struct so the port does not leak any

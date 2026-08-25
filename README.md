@@ -109,6 +109,20 @@ definition of one policy, and the two would drift. The address handed to
 `LogSend` is deliberately *not* normalised — that row is the audit trail of what
 was actually mailed.
 
+**If your own code writes suppression rows, normalise them yourself.** The
+guarantee above covers only what emailkit hands you. An admin unsubscribe form,
+a complaint import or a manual block never passes through emailkit, so apply the
+same lowercase-and-trim before storing:
+
+```go
+addr := strings.ToLower(strings.TrimSpace(input))
+```
+
+Skipping this reproduces, one layer out, the exact bug the guarantee prevents: a
+row stored as `User@Example.com` is never matched by a lookup for
+`user@example.com`. The address stays mailable, and nothing reports a problem —
+the suppression silently has no effect.
+
 ### Webhook
 
 Mount the webhook without body-consuming middleware and without auth (Resend
