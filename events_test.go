@@ -15,6 +15,12 @@ func TestIsPermanentBounce(t *testing.T) {
 		{"transient greylist", "Transient", "General", false},
 		{"undetermined", "Undetermined", "", false},
 		{"empty", "", "", false},
+		// Regression guards: bounceType alone must decide permanence. Under
+		// the old "bounceType + subType" concatenation, these subtypes would
+		// have flipped the result to true and wrongly suppressed a live user.
+		{"transient subtype says permanently unavailable", "Transient", "PermanentlyUnavailable", false},
+		{"transient subtype says hard", "Transient", "HardFull", false},
+		{"permanent with transient-sounding subtype", "Permanent", "MailboxFull", true},
 	}
 	for _, c := range cases {
 		if got := isPermanentBounce(c.bType, c.subType); got != c.want {
