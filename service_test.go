@@ -811,3 +811,151 @@ func TestDomainOf(t *testing.T) {
 		}
 	}
 }
+
+// doublePanicStore panics on BOTH store calls the panic path makes: the
+// suppression lookup that begins the send, and the audit write that records the
+// resulting panic. That is the exact shape auditPanic's inner recover exists
+// for — a Store broken enough to panic once is very likely to panic again on
+// the next call — and without it the second panic is raised inside a deferred
+// recover, which no further recover can catch.
+type doublePanicStore struct{ fakeStore }
+
+func (d *doublePanicStore) IsSuppressed(context.Context, string) (bool, error) {
+	panic("suppression lookup exploded")
+}
+
+func (d *doublePanicStore) LogSend(context.Context, SendRecord) error {
+	panic("audit write exploded")
+}
+
+// TestFire_PanicInPanicAuditDoesNotKillTheProcess pins the inner recover in
+// auditPanic. Deleting that defer leaves the rest of the suite green — every
+// other panic test uses a Store that panics exactly once, and by then the
+// recover has already fired — while the failure it hides is total: the process
+// dies. There is no recover() here on purpose; if the second panic escapes, the
+// test binary dies, which is precisely the production symptom.
+func TestFire_PanicInPanicAuditDoesNotKillTheProcess(t *testing.T) {
+	st := &doublePanicStore{}
+	svc := NewServiceWithSender(st, Config{APIKey: "key"}, Registry{}, &fakeSvcSender{})
+	buf := captureLogs(t, svc)
+
+	svc.SendRaw(context.Background(), "boom@example.com", "s", "h", "lbl")
+
+	// Wait is asserted to RETURN, not merely called: a send goroutine that died
+	// mid-defer would never run wg.Done, so a plain svc.Wait() would hang the
+	// suite instead of failing it.
+	waited := make(chan struct{})
+	go func() { defer close(waited); svc.Wait() }()
+	select {
+	case <-waited:
+	case <-time.After(sendReturnTimeout):
+		t.Fatal("Wait() must return: both panics were supposed to be contained")
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "email send panicked") {
+		t.Fatalf("want the first panic logged, got %q", out)
+	}
+	if !strings.Contains(out, "email panic audit write panicked") {
+		t.Fatalf("want the audit-write panic logged too, got %q", out)
+	}
+	if strings.Contains(out, "boom@example.com") {
+		t.Fatalf("neither panic line may carry the full address, got %q", out)
+	}
+}
+
+// ctxAwarePanicStore panics on the suppression lookup like panicStore, and —
+// like a real *sql.DB-backed Store — refuses to write on a dead context. The
+// combination is what makes the context auditPanic runs on observable.
+type ctxAwarePanicStore struct{ ctxAwareStore }
+
+func (c *ctxAwarePanicStore) IsSuppressed(context.Context, string) (bool, error) {
+	panic("store exploded on an already-returned request")
+}
+
+// TestFire_PanicAuditWritesOnTheDetachedContext pins the ordering inside fire():
+// sendCtx is resolved BEFORE the recover is registered, so the panic path has a
+// live context to audit on.
+//
+// Nothing else in the suite covers a cancelled caller AND a panic together —
+// TestFire_SendSurvivesCallerContextCancellation never panics, and every panic
+// test runs on context.Background() — so handing auditPanic the caller's ctx
+// keeps the whole suite green. In production it loses the audit row for every
+// panicking send whose request has already returned, which for a fire-and-forget
+// send is the normal case, not the edge case.
+func TestFire_PanicAuditWritesOnTheDetachedContext(t *testing.T) {
+	st := &ctxAwarePanicStore{}
+	svc := NewServiceWithSender(st, Config{APIKey: "key"}, Registry{}, &fakeSvcSender{})
+	buf := captureLogs(t, svc)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the request returned before the send goroutine was scheduled
+
+	svc.SendRaw(ctx, "boom@example.com", "s", "h", "lbl")
+	svc.Wait()
+
+	logs, _ := st.snapshot()
+	if len(logs) != 1 || logs[0].Status != StatusFailed {
+		t.Fatalf("the panic audit row must be written on the detached context, got %+v", logs)
+	}
+	if logs[0].Error == nil || *logs[0].Error != reasonPanicked {
+		t.Fatalf("audit reason must name the panic, got %v", logs[0].Error)
+	}
+	if strings.Contains(buf.String(), "email audit write failed") {
+		t.Fatalf("the panic audit write must not be refused by a cancelled context, got %q", buf.String())
+	}
+}
+
+// selfFormattingPanic is a panic value whose String() panics — and panics with
+// a value of its own type, which defeats fmt's own containment too: fmt
+// normally prints "%!v(PANIC=String method: …)", but re-panics when formatting
+// the recovered value panics in turn. A consumer's panic value is arbitrary, so
+// this is reachable from outside the module.
+type selfFormattingPanic struct{}
+
+func (selfFormattingPanic) String() string { panic(selfFormattingPanic{}) }
+
+// unprintablePanicStore panics with a value that cannot be rendered.
+type unprintablePanicStore struct{ fakeStore }
+
+func (u *unprintablePanicStore) IsSuppressed(context.Context, string) (bool, error) {
+	panic(selfFormattingPanic{})
+}
+
+// TestFire_UnprintablePanicValueIsContained pins panicText. Logging the
+// recovered value directly defers its formatting to the slog handler, which
+// runs OUTSIDE fire()'s recover — so this panic value escapes there and kills
+// the process, defeating the exact guarantee fire() exists to provide. Again no
+// recover() here: an escape kills the test binary, as it would the server.
+func TestFire_UnprintablePanicValueIsContained(t *testing.T) {
+	st := &unprintablePanicStore{}
+	svc := NewServiceWithSender(st, Config{APIKey: "key"}, Registry{}, &fakeSvcSender{})
+	buf := captureLogs(t, svc)
+
+	svc.SendRaw(context.Background(), "boom@example.com", "s", "h", "lbl")
+
+	waited := make(chan struct{})
+	go func() { defer close(waited); svc.Wait() }()
+	select {
+	case <-waited:
+	case <-time.After(sendReturnTimeout):
+		t.Fatal("Wait() must return: formatting the panic value must not escape")
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "email send panicked") {
+		t.Fatalf("want the panic logged despite the unprintable value, got %q", out)
+	}
+	if !strings.Contains(out, panicUnprintable) {
+		t.Fatalf("want the unprintable placeholder in place of the value, got %q", out)
+	}
+	// The rest of the panic path must be unaffected: a value nobody can print
+	// is still a send that must leave a row.
+	logs, _ := st.snapshot()
+	if len(logs) != 1 || logs[0].Status != StatusFailed {
+		t.Fatalf("an unprintable panic must still leave an audit row, got %+v", logs)
+	}
+	if logs[0].Error == nil || *logs[0].Error != reasonPanicked {
+		t.Fatalf("audit reason must name the panic, got %v", logs[0].Error)
+	}
+}

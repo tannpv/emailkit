@@ -2,6 +2,7 @@ package emailkit
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"maps"
 	"runtime/debug"
@@ -41,6 +42,19 @@ type Store interface {
 	// webhook path — two distinct operations, deliberately not merged. One
 	// updates an existing log row by provider id; the other grows the
 	// suppression list by address. A delivered event does only the first.
+	//
+	// IDEMPOTENCY CONTRACT: both operations MUST be idempotent — applying the
+	// same event twice must reach the same state and MUST NOT error the second
+	// time. WebhookHandler.Handle answers a failed store write with a retryable
+	// error so the provider redelivers the event, and that redelivery replays
+	// whichever of the two calls had already succeeded. Suppress written as a
+	// bare INSERT therefore converts one transient failure into a permanent
+	// duplicate-key loop: every retry fails on the row the first attempt wrote,
+	// the event is never accepted, and — for a hard bounce — the address is
+	// never suppressed. Use set semantics (an upsert, ON CONFLICT DO NOTHING,
+	// or an equivalent) for Suppress, and a plain UPDATE by provider id for
+	// MarkByProviderID. See storeFailure in webhook.go for why retry is the
+	// right answer given this property.
 	MarkByProviderID(ctx context.Context, providerID, status string, reason *string) error
 	Suppress(ctx context.Context, email, reason string) error
 }
@@ -200,9 +214,12 @@ func (s *Service) fire(ctx context.Context, to, label string, render func(contex
 		// simply vanished. Contain it AND record it.
 		defer func() {
 			if r := recover(); r != nil {
+				// panicText, not r: rendering the value must not be left to
+				// the log handler, which runs outside this recover. See
+				// panicText.
 				s.log().Error("email send panicked",
 					"label", label, "domain", domainOf(to),
-					"panic", r, "stack", string(debug.Stack()))
+					"panic", panicText(r), "stack", string(debug.Stack()))
 				s.auditPanic(sendCtx, to, label)
 			}
 		}()
@@ -271,6 +288,37 @@ func (s *Service) deliver(ctx context.Context, to, subject, html, label string) 
 		return
 	}
 	s.audit(ctx, to, subject, label, StatusSent, strpOrNil(id), nil)
+}
+
+// panicUnprintable stands in for a recovered panic value that could not be
+// rendered. It deliberately says nothing about the value: what just failed is
+// the act of describing it, so there is nothing left worth trusting.
+const panicUnprintable = "(unprintable panic value: formatting it panicked)"
+
+// panicText renders a recovered panic value as a plain string, containing any
+// panic that the rendering itself raises.
+//
+// The value comes from CONSUMER code and carries consumer methods. Handing it
+// to slog as an attribute defers the formatting to the log handler, which runs
+// OUTSIDE the deferred recover in fire() — so a String, Error or MarshalText
+// method that panics escapes and takes the process down, which is the one
+// outcome fire() exists to prevent. Rendering here, and passing slog a finished
+// string, moves that work back inside a recover we own.
+//
+// fmt already contains the ordinary case (it prints "%!v(PANIC=String method:
+// …)"), but it re-panics when formatting the recovered value panics in turn —
+// a value that panics with itself does exactly that. So the containment cannot
+// be delegated to fmt either.
+//
+// The value recovered below is deliberately NOT formatted or logged: formatting
+// it is precisely what just failed.
+func panicText(r any) (text string) {
+	defer func() {
+		if recover() != nil {
+			text = panicUnprintable
+		}
+	}()
+	return fmt.Sprintf("%+v", r)
 }
 
 // auditPanic records a recovered panic in the audit trail, so the mail leaves a
