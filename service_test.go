@@ -33,8 +33,15 @@ type fakeStore struct {
 	// marks + suppress record the webhook path (webhook_test.go). They live on
 	// the one fake rather than a second webhook-only fake, because Store is a
 	// single port and two fakes would be two things to keep in step with it.
-	marks    []markCall
-	suppress []suppressCall
+	//
+	// markErr/suppressErr inject a failure into those two calls. The call is
+	// still RECORDED before the error is returned, which is what lets a test
+	// assert the handler attempted the second store call after the first one
+	// failed.
+	marks       []markCall
+	markErr     error
+	suppress    []suppressCall
+	suppressErr error
 }
 
 // markCall + suppressCall capture what the webhook handler asked the port to do.
@@ -75,14 +82,14 @@ func (f *fakeStore) MarkByProviderID(_ context.Context, providerID, status strin
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.marks = append(f.marks, markCall{id: providerID, status: status, reason: reason})
-	return nil
+	return f.markErr
 }
 
 func (f *fakeStore) Suppress(_ context.Context, email, reason string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.suppress = append(f.suppress, suppressCall{email: email, reason: reason})
-	return nil
+	return f.suppressErr
 }
 
 func (f *fakeStore) snapshot() ([]SendRecord, []string) {

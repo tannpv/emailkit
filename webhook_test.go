@@ -239,9 +239,24 @@ func TestWebhook_RejectsStaleTimestamp(t *testing.T) {
 	stale := now.Add(-6 * time.Minute)
 	req := signedRequest(t, testSecret, stale, `{"type":"email.bounced"}`)
 
-	if err := h.Handle(httptest.NewRecorder(), req); err == nil {
-		t.Fatal("a six-minute-old signed request must be rejected; " +
-			"accepting it lets a captured bounce be replayed to re-suppress an address")
+	// ErrStale specifically, not merely "some error": a rejection for the wrong
+	// reason (a broken signature check, say) would satisfy err != nil while
+	// proving nothing about the replay window this test exists to assert.
+	err := h.Handle(httptest.NewRecorder(), req)
+	if !errors.Is(err, ErrStale) {
+		t.Fatalf("err = %v, want %v; a six-minute-old signed request must be rejected "+
+			"as stale — accepting it lets a captured bounce be replayed to re-suppress an address", err, ErrStale)
+	}
+	assertStoreUntouched(t, st)
+}
+
+// assertStoreUntouched proves a rejection happened BEFORE any state was
+// written. A handler that suppressed the address and then returned ErrStale
+// would pass an error-only assertion while having already done the damage.
+func assertStoreUntouched(t *testing.T, f *fakeStore) {
+	t.Helper()
+	if len(f.marks) != 0 || len(f.suppress) != 0 {
+		t.Fatalf("rejected request touched the store: marks=%+v suppress=%+v", f.marks, f.suppress)
 	}
 }
 
@@ -255,10 +270,12 @@ func TestWebhook_RejectsFutureTimestamp(t *testing.T) {
 	future := now.Add(6 * time.Minute)
 	req := signedRequest(t, testSecret, future, `{"type":"email.bounced"}`)
 
-	if err := h.Handle(httptest.NewRecorder(), req); err == nil {
-		t.Fatal("a far-future timestamp must be rejected — otherwise an attacker " +
-			"mints a request that stays valid indefinitely")
+	err := h.Handle(httptest.NewRecorder(), req)
+	if !errors.Is(err, ErrStale) {
+		t.Fatalf("err = %v, want %v; a far-future timestamp must be rejected as stale — "+
+			"otherwise an attacker mints a request that stays valid indefinitely", err, ErrStale)
 	}
+	assertStoreUntouched(t, st)
 }
 
 func TestWebhook_AcceptsFreshTimestamp(t *testing.T) {
@@ -273,5 +290,103 @@ func TestWebhook_AcceptsFreshTimestamp(t *testing.T) {
 
 	if err := h.Handle(httptest.NewRecorder(), req); err != nil {
 		t.Fatalf("a fresh request must be accepted, got %v", err)
+	}
+}
+
+// errStoreDown is the cause a failing store returns. The tests below assert it
+// survives the ErrStoreFailure wrap: a consumer that can match the sentinel but
+// cannot log the cause has no way to diagnose why Resend keeps retrying.
+var errStoreDown = errors.New("store unavailable")
+
+// A hard bounce whose Suppress fails is the worst case in the package: with the
+// error swallowed, IsSuppressed keeps answering false and that dead address
+// keeps being mailed, costing the SHARED sending domain its reputation. The
+// error must reach the consumer so it can answer 5xx and let Resend redeliver.
+func TestWebhook_SuppressFailureIsRetryable(t *testing.T) {
+	f := &fakeStore{suppressErr: errStoreDown}
+	h := frozenWebhook(f, testSecret)
+	body := `{"type":"email.bounced","data":{"email_id":"e_9","to":"hard@x.com","bounce":{"type":"Permanent","subType":"General"}}}`
+
+	w, err := serve(h, signedRequest(t, testSecret, testNow, body))
+	if !errors.Is(err, ErrStoreFailure) {
+		t.Fatalf("err = %v, want %v", err, ErrStoreFailure)
+	}
+	if !errors.Is(err, errStoreDown) {
+		t.Fatalf("err = %v, want the underlying cause %v to remain loggable", err, errStoreDown)
+	}
+	// A success body is the lie that stops the retry: it tells Resend the event
+	// was durably accepted when nothing was written.
+	if w.Body.Len() != 0 {
+		t.Fatalf("failed store write wrote the success body: %q", w.Body.String())
+	}
+}
+
+func TestWebhook_MarkFailureIsRetryable(t *testing.T) {
+	f := &fakeStore{markErr: errStoreDown}
+	h := frozenWebhook(f, testSecret)
+	body := `{"type":"email.delivered","data":{"email_id":"e_123","to":["a@x.com"]}}`
+
+	w, err := serve(h, signedRequest(t, testSecret, testNow, body))
+	if !errors.Is(err, ErrStoreFailure) {
+		t.Fatalf("err = %v, want %v", err, ErrStoreFailure)
+	}
+	if !errors.Is(err, errStoreDown) {
+		t.Fatalf("err = %v, want the underlying cause %v to remain loggable", err, errStoreDown)
+	}
+	if w.Body.Len() != 0 {
+		t.Fatalf("failed store write wrote the success body: %q", w.Body.String())
+	}
+}
+
+// A bounce triggers TWO store calls. When the log-row write fails, the
+// suppression must still be ATTEMPTED rather than skipped: it is the
+// safety-critical one, and deferring it to a redelivery that may never arrive
+// leaves the dead address mailable in the meantime. Both operations are
+// idempotent, so the retry provoked by the returned error converges.
+func TestWebhook_MarkFailureStillAttemptsSuppress(t *testing.T) {
+	f := &fakeStore{markErr: errStoreDown}
+	h := frozenWebhook(f, testSecret)
+	body := `{"type":"email.bounced","data":{"email_id":"e_9","to":"hard@x.com","bounce":{"type":"Permanent","subType":"General"}}}`
+
+	_, err := serve(h, signedRequest(t, testSecret, testNow, body))
+	if !errors.Is(err, ErrStoreFailure) {
+		t.Fatalf("err = %v, want %v", err, ErrStoreFailure)
+	}
+	if len(f.suppress) != 1 {
+		t.Fatalf("suppress = %+v, want one attempt even though the mark failed", f.suppress)
+	}
+	if s := f.suppress[0]; s.email != "hard@x.com" || s.reason != ReasonBounced {
+		t.Fatalf("suppress = %+v, want {hard@x.com bounced}", s)
+	}
+}
+
+// Every other webhook test injects WithClock, so none of them exercises
+// NewWebhookHandler(store, secret) — the constructor every consumer actually
+// uses in production. That left both defaults unasserted: a reviewer changed
+// `tolerance: DefaultTolerance` to `tolerance: 0` and all ten tests stayed
+// green, and dropping `now: time.Now` would ship green too and then nil-panic
+// on the first production request.
+//
+// The request is signed 30s in the past — comfortably inside DefaultTolerance
+// but unambiguously outside a zero tolerance. Signing at exactly time.Now()
+// would not discriminate, because signedRequest truncates to whole seconds and
+// the resulting sub-second skew can round to zero.
+func TestWebhook_ZeroOptionConstructorUsesRealDefaults(t *testing.T) {
+	f := &fakeStore{}
+	h := NewWebhookHandler(f, testSecret) // no options: the production path
+
+	body := `{"type":"email.delivered","data":{"email_id":"e_default","to":["a@x.com"]}}`
+	w, err := serve(h, signedRequest(t, testSecret, time.Now().Add(-30*time.Second), body))
+	if err != nil {
+		t.Fatalf("the default constructor must accept a request signed 30s ago, got %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if got := w.Body.String(); got != `{"received":true}` {
+		t.Fatalf("body = %q, want %q", got, `{"received":true}`)
+	}
+	if len(f.marks) != 1 || f.marks[0].id != "e_default" || f.marks[0].status != StatusDelivered {
+		t.Fatalf("marks = %+v, want one delivered mark for e_default", f.marks)
 	}
 }
