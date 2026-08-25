@@ -36,9 +36,15 @@ type resendClient struct {
 // client-level timeout is the backstop regardless of what the caller passes.
 const resendRequestTimeout = 15 * time.Second
 
-// NewResendSender returns the production sender as an interface, so the
-// concrete type cannot be named or built outside this package.
-func NewResendSender() Sender {
+// newResendSender returns the production sender as an interface.
+//
+// Unexported deliberately. An exported constructor handed any consumer a live,
+// ready-to-use provider client whose Send is exported, so
+// `emailkit.NewResendSender().Send(...)` mailed a hard-bounced address with no
+// suppression check and no audit row — bypassing the guarantee this whole
+// package exists to provide. The only way to obtain a working sender is now
+// NewService, which wires it behind deliver().
+func newResendSender() Sender {
 	return &resendClient{http: &http.Client{Timeout: resendRequestTimeout}, endpoint: resendEndpoint}
 }
 
