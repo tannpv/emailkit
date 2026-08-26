@@ -115,19 +115,21 @@ func (f *fakeStore) snapshot() ([]SendRecord, []string) {
 // package, both are _test.go files) to avoid a redeclaration error. It records
 // its arguments so tests can assert what actually reached the provider.
 type fakeSvcSender struct {
-	mu      sync.Mutex
-	calls   int
-	id      string
-	err     error
-	to      string
-	subject string
-	html    string
+	mu                   sync.Mutex
+	calls                int
+	id                   string
+	err                  error
+	to                   string
+	subject              string
+	html                 string
+	lastAPIKey, lastFrom string
 }
 
-func (s *fakeSvcSender) Send(_ context.Context, _, _, to, subject, html string) (string, error) {
+func (s *fakeSvcSender) Send(_ context.Context, apiKey, from, to, subject, html string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
+	s.lastAPIKey, s.lastFrom = apiKey, from
 	s.to, s.subject, s.html = to, subject, html
 	return s.id, s.err
 }
@@ -965,6 +967,73 @@ func (u *unprintablePanicStore) IsSuppressed(context.Context, string) (bool, err
 // runs OUTSIDE fire()'s recover — so this panic value escapes there and kills
 // the process, defeating the exact guarantee fire() exists to provide. Again no
 // recover() here: an escape kills the test binary, as it would the server.
+// TestDeliver_ResolverSuppliesCredentials pins that a non-nil Resolve REPLACES
+// the static Config fields rather than layering over them.
+func TestDeliver_ResolverSuppliesCredentials(t *testing.T) {
+	st := &fakeStore{}
+	sn := &fakeSvcSender{id: "p1"}
+	cfg := Config{
+		APIKey: "static-key",
+		From:   "static@example.com",
+		Resolve: func(context.Context) (string, string, error) {
+			return "resolved-key", "resolved@example.com", nil
+		},
+	}
+	svc := NewServiceWithSender(st, cfg, Registry{"k": {Subject: "s", Body: "b"}}, sn)
+	svc.Send(context.Background(), "k", "a@b.c", nil)
+	svc.Wait()
+
+	if sn.lastAPIKey != "resolved-key" {
+		t.Fatalf("resolver must win over the static key, got %q", sn.lastAPIKey)
+	}
+	if sn.lastFrom != "resolved@example.com" {
+		t.Fatalf("resolver must win over the static from, got %q", sn.lastFrom)
+	}
+}
+
+// TestDeliver_ResolverErrorSkipsWithoutSending is the load-bearing case: a
+// Resolve error must skip the send rather than falling back to the static
+// APIKey/From. Sending with credentials the operator believes they replaced
+// is worse than not sending.
+func TestDeliver_ResolverErrorSkipsWithoutSending(t *testing.T) {
+	st := &fakeStore{}
+	sn := &fakeSvcSender{}
+	cfg := Config{
+		APIKey: "static-key",
+		Resolve: func(context.Context) (string, string, error) {
+			return "", "", errors.New("settings table unreachable")
+		},
+	}
+	svc := NewServiceWithSender(st, cfg, Registry{"k": {Subject: "s", Body: "b"}}, sn)
+	svc.Send(context.Background(), "k", "a@b.c", nil)
+	svc.Wait()
+
+	// Falling back to the static key would send with credentials the operator
+	// believes they replaced — worse than not sending.
+	if sn.calls != 0 {
+		t.Fatal("a resolver error must not fall back to the static credentials")
+	}
+	if len(st.logs) != 1 || st.logs[0].Status != StatusSkipped {
+		t.Fatalf("want one skipped row, got %+v", st.logs)
+	}
+}
+
+// TestDeliver_NilResolverUsesStaticConfig pins that nil Resolve preserves
+// v0.1.0 behaviour exactly: liseuse and bacnam pass static credentials and
+// must be unaffected by this change.
+func TestDeliver_NilResolverUsesStaticConfig(t *testing.T) {
+	st := &fakeStore{}
+	sn := &fakeSvcSender{id: "p1"}
+	svc := NewServiceWithSender(st, Config{APIKey: "static-key", From: "static@example.com"},
+		Registry{"k": {Subject: "s", Body: "b"}}, sn)
+	svc.Send(context.Background(), "k", "a@b.c", nil)
+	svc.Wait()
+
+	if sn.lastAPIKey != "static-key" || sn.lastFrom != "static@example.com" {
+		t.Fatalf("nil Resolve must use the static fields, got %q / %q", sn.lastAPIKey, sn.lastFrom)
+	}
+}
+
 func TestFire_UnprintablePanicValueIsContained(t *testing.T) {
 	st := &unprintablePanicStore{}
 	svc := NewServiceWithSender(st, Config{APIKey: "key"}, Registry{}, &fakeSvcSender{})

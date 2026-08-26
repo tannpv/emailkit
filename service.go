@@ -96,6 +96,19 @@ type SendRecord struct {
 type Config struct {
 	APIKey string
 	From   string
+
+	// Resolve, when non-nil, supplies credentials per send instead of the
+	// static fields above, and REPLACES them rather than layering over them.
+	//
+	// draftright stores its Resend key in a table its admin UI writes, so an
+	// operator must be able to change it without a restart. A static Config
+	// would keep using the old value while nothing errors — the failure mode
+	// where the mechanism moves and the symptom appears far from the change.
+	//
+	// An error from Resolve skips the send. It deliberately does NOT fall back
+	// to APIKey/From: sending with credentials the operator believes they
+	// replaced is worse than not sending.
+	Resolve func(ctx context.Context) (apiKey, from string, err error)
 }
 
 // Reasons written to SendRecord.Error when a send does not reach the provider.
@@ -291,12 +304,19 @@ func (s *Service) deliver(ctx context.Context, to, subject, html, label string) 
 		s.audit(ctx, to, subject, label, StatusSuppressed, nil, strp(reasonSuppressed))
 		return
 	}
-	if s.cfg.APIKey == "" {
+	apiKey, from, err := s.credentials(ctx)
+	if err != nil {
+		s.log().Warn("email credential resolution failed",
+			"label", label, "domain", domainOf(to), "err", err)
 		s.audit(ctx, to, subject, label, StatusSkipped, nil, strp(reasonNotConfigured))
 		return
 	}
-	id, err := s.client.Send(ctx, s.cfg.APIKey, s.cfg.From, to, subject, html)
-	if err != nil {
+	if apiKey == "" {
+		s.audit(ctx, to, subject, label, StatusSkipped, nil, strp(reasonNotConfigured))
+		return
+	}
+	id, sendErr := s.client.Send(ctx, apiKey, from, to, subject, html)
+	if sendErr != nil {
 		// Recipient is logged as a hash-free domain only. The full address is
 		// PII and the audit row already holds it under the project's own
 		// retention rules; repeating it in application logs spreads it to a
@@ -307,11 +327,21 @@ func (s *Service) deliver(ctx context.Context, to, subject, html, label string) 
 		// text comes from a Store or Sender implementation, and redacting
 		// arbitrary error strings is not reliable. Keeping the address out of
 		// those errors is the implementation's contract; see Store.
-		s.log().Warn("email send failed", "label", label, "domain", domainOf(to), "err", err)
-		s.audit(ctx, to, subject, label, StatusFailed, nil, strp(err.Error()))
+		s.log().Warn("email send failed", "label", label, "domain", domainOf(to), "err", sendErr)
+		s.audit(ctx, to, subject, label, StatusFailed, nil, strp(sendErr.Error()))
 		return
 	}
 	s.audit(ctx, to, subject, label, StatusSent, strpOrNil(id), nil)
+}
+
+// credentials returns the key and from-address for this send. One definition,
+// used by the single send path — see the Config.Resolve doc for why an error
+// here must not fall back to the static fields.
+func (s *Service) credentials(ctx context.Context) (apiKey, from string, err error) {
+	if s.cfg.Resolve == nil {
+		return s.cfg.APIKey, s.cfg.From, nil
+	}
+	return s.cfg.Resolve(ctx)
 }
 
 // panicUnprintable stands in for a recovered panic value that could not be
