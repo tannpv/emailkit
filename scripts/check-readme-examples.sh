@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# check-readme-examples.sh — compiles every ```go fenced block in README.md.
+#
+# WHY THIS EXISTS: three projects copy code straight out of README.md. It has
+# already shipped broken twice, caught only by human review: a
+# `log.Error(...)` call (stdlib `log` has no such method — it was `slog`) and
+# an example built around `NewResendSender`, a constructor deliberately
+# removed because it let a consumer obtain a live provider client and bypass
+# the suppression chokepoint in deliver(). Neither mistake needs a human to
+# catch a second time; both are ordinary compile errors once the example is
+# actually built against this commit.
+#
+# CONVENTION — read this before editing a ```go block in README.md:
+#
+#   1. Every block is a FRAGMENT, not a whole program, and is compiled inside
+#      a throwaway module that `replace`s this package with the current
+#      checkout (so a signature change is caught immediately, not after the
+#      next tagged release).
+#
+#   2. A block is pasted TOP-LEVEL, unmodified, into the generated file when
+#      its first non-blank line starts with `type`, `const`, `var`, or `func`
+#      (e.g. the Store interface listing). Every other block — plain
+#      statements — is wrapped verbatim in its own `func readmeExampleN() {
+#      ... }`. This is a syntactic rule, not a semantic one: it only looks at
+#      the first token of the block.
+#
+#   3. Fragments reference names the surrounding prose implies but never
+#      declares (a caller's own store, its API key, the current user, ...).
+#      Rather than rewrite examples to be self-contained (which would make
+#      them worse documentation), this script declares a fixed PRELUDE of
+#      placeholder identifiers once, shared by every wrapped block:
+#
+#         myStore        emailkit.Store            (a no-op fake)
+#         mySender       emailkit.Sender            (a no-op fake)
+#         key, from      string
+#         code           string
+#         ctx            context.Context
+#         user           struct{ Email string }
+#         cfg            emailkit.Config
+#         templates      emailkit.Registry
+#         input          string
+#         webhookSecret  string
+#         mux            *http.ServeMux
+#         fixed          time.Time
+#         SendRecord     = emailkit.SendRecord      (type alias, for the Store
+#                                                     listing block, which
+#                                                     names it unqualified
+#                                                     because inside package
+#                                                     emailkit it IS
+#                                                     unqualified)
+#
+#      If a README edit introduces a new example that references an
+#      identifier not in this list, add a placeholder for it in the PRELUDE
+#      below rather than letting the build fail on an unrelated-looking
+#      "undefined: foo".
+#
+#   4. All blocks land in ONE generated file sharing ONE import block, so an
+#      import used by one example but not another never triggers Go's
+#      unused-import error — it is used somewhere else in the same file.
+#
+#   5. A wrapped block's own top-level `x := ...` declarations are demonstrating
+#      API shape, not always consumed again within that same short fragment
+#      (README block 6 declares `h` purely to show the WithTolerance/WithClock
+#      options, for instance). Go's unused-variable check does not know that,
+#      so this script appends a trailing `_ = x` for every such name it finds
+#      at the top level of the block (a line that, once trimmed, starts with
+#      `name :=`). That heuristic does not descend into nested braces or
+#      composite literals, so it will not (and must not) fire on a `key:
+#      value` field inside a struct/map literal.
+#
+# Usage: scripts/check-readme-examples.sh [path-to-README.md]
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+README="${1:-$ROOT/README.md}"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+# --- 1. extract every ```go fenced block into its own file -----------------
+awk -v workdir="$WORK" '
+  /^```go[[:space:]]*$/ { infence=1; n++; fname=sprintf("%s/block_%02d.go", workdir, n); next }
+  /^```[[:space:]]*$/   { if (infence) { infence=0 }; next }
+  { if (infence) print > fname }
+' "$README"
+
+shopt -s nullglob
+blocks=("$WORK"/block_*.go)
+if [ ${#blocks[@]} -eq 0 ]; then
+  echo "::error::no fenced go blocks found in $README — extractor is broken or README lost its examples"
+  exit 1
+fi
+
+# --- 2. assemble the throwaway module ---------------------------------------
+MOD="$WORK/mod"
+mkdir -p "$MOD"
+cat > "$MOD/go.mod" <<EOF
+module readmecheck
+
+go 1.25.0
+
+require github.com/tannpv/emailkit v0.0.0
+
+replace github.com/tannpv/emailkit => $ROOT
+EOF
+
+GEN="$MOD/main.go"
+{
+cat <<'PRELUDE'
+// Code generated by scripts/check-readme-examples.sh from README.md. DO NOT EDIT.
+package main
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/tannpv/emailkit"
+)
+
+// ---- PRELUDE: placeholders the README's fragments reference but never
+// ---- declare. See the convention comment at the top of the generating
+// ---- script for what each name is and why it exists.
+
+// SendRecord aliases emailkit.SendRecord so the Store-interface listing block
+// compiles referencing it unqualified, exactly as it appears inside package
+// emailkit itself.
+type SendRecord = emailkit.SendRecord
+
+type readmeFakeStore struct{}
+
+func (readmeFakeStore) IsSuppressed(ctx context.Context, email string) (bool, error) {
+	return false, nil
+}
+func (readmeFakeStore) LogSend(ctx context.Context, r emailkit.SendRecord) error { return nil }
+func (readmeFakeStore) Template(ctx context.Context, key string) (string, string, bool) {
+	return "", "", false
+}
+func (readmeFakeStore) MarkByProviderID(ctx context.Context, providerID, status string, reason *string) error {
+	return nil
+}
+func (readmeFakeStore) Suppress(ctx context.Context, email, reason string) error { return nil }
+
+type readmeFakeSender struct{}
+
+func (readmeFakeSender) Send(ctx context.Context, apiKey, from, to, subject, html string) (string, error) {
+	return "", nil
+}
+
+var (
+	myStore       emailkit.Store  = readmeFakeStore{}
+	mySender      emailkit.Sender = readmeFakeSender{}
+	key, from     string
+	code          string
+	ctx           = context.Background()
+	user          = struct{ Email string }{Email: "user@example.com"}
+	cfg           emailkit.Config
+	templates     emailkit.Registry
+	input         string
+	webhookSecret string
+	mux           = http.NewServeMux()
+	fixed         time.Time
+)
+
+// Referenced so "errors" stays used even on a README revision whose only
+// errors.Is call moves or is edited away; every block below is free to (and
+// today does) use it directly too.
+var _ = errors.Is
+var _ = slog.Default
+var _ = strings.ToLower
+
+// main exists only so `go build` on this package main succeeds; the point of
+// this module is compiling the examples below, never running any of them.
+func main() {}
+PRELUDE
+} > "$GEN"
+
+i=0
+for b in "${blocks[@]}"; do
+  i=$((i+1))
+  first_line="$(grep -m1 -E '[^[:space:]]' "$b" || true)"
+  {
+    echo
+    if [[ "$first_line" =~ ^[[:space:]]*(type|const|var|func)[[:space:]] ]]; then
+      echo "// --- README fenced go block $i (top-level declaration) ---"
+      cat "$b"
+    else
+      echo "// --- README fenced go block $i (wrapped statement fragment) ---"
+      echo "func readmeExample$i() {"
+      cat "$b"
+      # Silence "declared and not used" for the block's own top-level `x :=`
+      # names — see convention rule 5 above. Only a line that, once trimmed,
+      # starts with `identifier :=` counts; that excludes any `key: value`
+      # line inside a nested struct or map literal.
+      grep -oE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:=' "$b" |
+        sed -E 's/^[[:space:]]*//; s/[[:space:]]*:=$//' |
+        sort -u |
+        while IFS= read -r ident; do
+          echo "	_ = $ident"
+        done
+      echo "}"
+    fi
+  } >> "$GEN"
+done
+
+if command -v gofmt >/dev/null 2>&1; then
+  gofmt -w "$GEN" || true
+fi
+
+echo "---- generated $GEN ----"
+cat -n "$GEN"
+echo "-------------------------"
+
+(cd "$MOD" && go build ./...)
+echo "ok — README.md's Go examples compile against this commit"

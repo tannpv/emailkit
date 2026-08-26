@@ -12,7 +12,11 @@ import (
 
 // Store is the project's own persistence. This package never sees a schema,
 // which is how bacnam's tenant_id stays out of it: bacnam's implementation
-// closes over the tenant and emailkit never learns tenancy exists.
+// closes over the tenant and emailkit never learns tenancy exists. That is
+// true for Service — constructed one per tenant — but NOT for WebhookHandler:
+// it is one per endpoint, and a Resend delivery event carries no tenant, so
+// bacnam must resolve the tenant from the provider id inside
+// MarkByProviderID rather than closing over it.
 //
 // CONCURRENCY CONTRACT: implementations MUST be safe for concurrent use by
 // multiple goroutines. Send and SendRaw are fire-and-forget — each spawns a

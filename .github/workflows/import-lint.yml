@@ -9,8 +9,26 @@ jobs:
         run: |
           # emailkit is the only permitted path to a provider. A direct import
           # here means a send that skips the suppression check.
-          if grep -rnE '"github\.com/resend/|"github\.com/aws/aws-sdk-go.*/ses' \
-               --include='*.go' . ; then
+          #
+          # ONE list, not one grep branch per provider: adding a provider is
+          # one new array entry below, never a second alternation edited by
+          # hand elsewhere. Each entry is an import-path fragment matched
+          # right after an opening quote, so it only matches an actual Go
+          # import, never an unrelated string containing the same substring.
+          PROVIDER_IMPORT_PATTERNS=(
+            'github\.com/resend/'                  # Resend
+            'github\.com/aws/aws-sdk-go.*/ses'      # AWS SES (v1 and v2 paths)
+            'github\.com/keighl/postmark'           # Postmark
+            'github\.com/mrz1836/postmark'          # Postmark (community fork)
+            'github\.com/sendgrid/sendgrid-go'      # SendGrid
+            'github\.com/mailgun/mailgun-go'        # Mailgun (all major versions)
+            'gopkg\.in/mailgun/mailgun-go'          # Mailgun (legacy import path)
+          )
+          IFS='|'
+          PATTERN="${PROVIDER_IMPORT_PATTERNS[*]}"
+          unset IFS
+
+          if grep -rnE "\"($PATTERN)" --include='*.go' . ; then
             echo "::error::Import github.com/tannpv/emailkit instead of a provider SDK."
             exit 1
           fi

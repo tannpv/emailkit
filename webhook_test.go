@@ -445,26 +445,50 @@ func TestWebhook_MarkFailureStillAttemptsSuppress(t *testing.T) {
 // green, and dropping `now: time.Now` would ship green too and then nil-panic
 // on the first production request.
 //
-// The request is signed 30s in the past — comfortably inside DefaultTolerance
-// but unambiguously outside a zero tolerance. Signing at exactly time.Now()
-// would not discriminate, because signedRequest truncates to whole seconds and
-// the resulting sub-second skew can round to zero.
+// The window is derived from DefaultTolerance itself rather than a hardcoded
+// ~30s: a request signed at DefaultTolerance-1s must be accepted and one
+// signed at DefaultTolerance+1s must be rejected, whatever DefaultTolerance is
+// set to. A fixed 30s magic number only discriminated `tolerance: 0` against
+// today's 5-minute value — if DefaultTolerance ever drifted to, say, an hour,
+// 30s-in-the-past would sit comfortably inside both the broken default and the
+// correct one, and this test would stay green through the regression it
+// exists to catch. Deriving the window from the constant keeps that
+// impossible: it fails the moment the zero-option constructor's tolerance
+// disagrees with DefaultTolerance, regardless of DefaultTolerance's value.
 func TestWebhook_ZeroOptionConstructorUsesRealDefaults(t *testing.T) {
-	f := &fakeStore{}
-	h := NewWebhookHandler(f, testSecret) // no options: the production path
-
 	body := `{"type":"email.delivered","data":{"email_id":"e_default","to":["a@x.com"]}}`
-	w, err := serve(h, signedRequest(t, testSecret, time.Now().Add(-30*time.Second), body))
-	if err != nil {
-		t.Fatalf("the default constructor must accept a request signed 30s ago, got %v", err)
-	}
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", w.Code)
-	}
-	if got := w.Body.String(); got != `{"received":true}` {
-		t.Fatalf("body = %q, want %q", got, `{"received":true}`)
-	}
-	if len(f.marks) != 1 || f.marks[0].id != "e_default" || f.marks[0].status != StatusDelivered {
-		t.Fatalf("marks = %+v, want one delivered mark for e_default", f.marks)
-	}
+
+	t.Run("just inside DefaultTolerance is accepted", func(t *testing.T) {
+		f := &fakeStore{}
+		h := NewWebhookHandler(f, testSecret) // no options: the production path
+
+		inside := time.Now().Add(-(DefaultTolerance - time.Second))
+		w, err := serve(h, signedRequest(t, testSecret, inside, body))
+		if err != nil {
+			t.Fatalf("the default constructor must accept a request signed %s ago (DefaultTolerance-1s), got %v",
+				DefaultTolerance-time.Second, err)
+		}
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", w.Code)
+		}
+		if got := w.Body.String(); got != `{"received":true}` {
+			t.Fatalf("body = %q, want %q", got, `{"received":true}`)
+		}
+		if len(f.marks) != 1 || f.marks[0].id != "e_default" || f.marks[0].status != StatusDelivered {
+			t.Fatalf("marks = %+v, want one delivered mark for e_default", f.marks)
+		}
+	})
+
+	t.Run("just outside DefaultTolerance is rejected as stale", func(t *testing.T) {
+		f := &fakeStore{}
+		h := NewWebhookHandler(f, testSecret) // no options: the production path
+
+		outside := time.Now().Add(-(DefaultTolerance + time.Second))
+		_, err := serve(h, signedRequest(t, testSecret, outside, body))
+		if !errors.Is(err, ErrStale) {
+			t.Fatalf("the default constructor must reject a request signed %s ago (DefaultTolerance+1s) as stale, got %v",
+				DefaultTolerance+time.Second, err)
+		}
+		assertStoreUntouched(t, f)
+	})
 }
