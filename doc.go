@@ -10,7 +10,11 @@
 // What this package deliberately does NOT own:
 //
 //   - Storage. Each project implements Store against its own schema, which is
-//     how bacnam keeps tenant_id out of here entirely.
+//     how bacnam keeps tenant_id out of here entirely. That holds for
+//     Service, which is constructed one per tenant and can close over it —
+//     but NOT for WebhookHandler, which is one per endpoint: a Resend
+//     delivery event carries no tenant, so bacnam's Store.MarkByProviderID
+//     must resolve the tenant from the provider id itself.
 //   - Product vocabulary. "Renewal reminder" belongs to draftright, not to a
 //     module a language-learning app imports.
 //   - Template content. Callers supply a Registry; this package only substitutes

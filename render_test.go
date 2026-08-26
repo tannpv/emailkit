@@ -28,9 +28,3 @@ func TestRender_HTMLEscapesBodyNotSubject(t *testing.T) {
 		t.Fatalf("body must be escaped, got %q", html)
 	}
 }
-
-func TestRender_SubjectEscapeFalseRaw(t *testing.T) {
-	if got := substitute("{{v}}", map[string]string{"v": "a&b"}, false); got != "a&b" {
-		t.Fatalf("escape=false must pass through, got %q", got)
-	}
-}

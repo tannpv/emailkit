@@ -27,7 +27,11 @@ func (r Registry) Render(key string, vars map[string]string) (subject, html stri
 	return substitute(def.Subject, vars, false), substitute(def.Body, vars, true)
 }
 
-var tokenRe = regexp.MustCompile(`\{\{(\w+)\}\}`)
+// tokenRe deliberately has no capture group: the name is extracted below by
+// slicing the full match (m[2:len(m)-2]), so a capturing group here would
+// just be unused — write the pattern to match that, not to imply a group
+// something reads.
+var tokenRe = regexp.MustCompile(`\{\{\w+\}\}`)
 
 // substitute replaces {{token}} from vars. An unknown token renders empty
 // rather than leaving the literal in place, so a missing variable never leaks
