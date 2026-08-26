@@ -282,7 +282,7 @@ func TestReasons_AreProviderNeutral(t *testing.T) {
 	providers := []string{"Resend", "SES", "Postmark", "SendGrid", "Mailgun"}
 	reasons := []string{
 		reasonNotConfigured, reasonSuppressed, reasonSuppressionLookup,
-		reasonNothingToSend, reasonPanicked,
+		reasonNothingToSend, reasonPanicked, reasonResolverFailed,
 	}
 	for _, reason := range reasons {
 		for _, p := range providers {
@@ -1015,6 +1015,59 @@ func TestDeliver_ResolverErrorSkipsWithoutSending(t *testing.T) {
 	}
 	if len(st.logs) != 1 || st.logs[0].Status != StatusSkipped {
 		t.Fatalf("want one skipped row, got %+v", st.logs)
+	}
+}
+
+// TestDeliver_ResolverErrorReasonDiffersFromNotConfigured is the audit-row
+// regression: a resolver that errors (settings table unreachable, a key that
+// failed to decrypt) and a system with no key configured at all used to write
+// the identical reasonNotConfigured string, so an auditor reading the row
+// later could not tell "nothing was ever set up" from "something is broken".
+// Both cases share StatusSkipped, so a status-only assertion would pass even
+// with the fix reverted — this test asserts on the reason strings themselves,
+// and that they differ from each other.
+func TestDeliver_ResolverErrorReasonDiffersFromNotConfigured(t *testing.T) {
+	// Case 1: the resolver returned an error. There WAS a key somewhere;
+	// resolving it failed.
+	resolverErrSt := &fakeStore{}
+	resolverErrSn := &fakeSvcSender{}
+	resolverErrCfg := Config{
+		Resolve: func(context.Context) (string, string, error) {
+			return "", "", errors.New("settings table unreachable")
+		},
+	}
+	resolverErrSvc := NewServiceWithSender(resolverErrSt, resolverErrCfg,
+		Registry{"k": {Subject: "s", Body: "b"}}, resolverErrSn)
+	resolverErrSvc.Send(context.Background(), "k", "a@b.c", nil)
+	resolverErrSvc.Wait()
+
+	resolverErrLogs, _ := resolverErrSt.snapshot()
+	if len(resolverErrLogs) != 1 || resolverErrLogs[0].Status != StatusSkipped {
+		t.Fatalf("want one skipped row for the resolver error, got %+v", resolverErrLogs)
+	}
+	if resolverErrLogs[0].Error == nil || *resolverErrLogs[0].Error != reasonResolverFailed {
+		t.Fatalf("want reason %q for a resolver error, got %v", reasonResolverFailed, resolverErrLogs[0].Error)
+	}
+
+	// Case 2: no key configured at all — nil Resolve, empty static APIKey.
+	noKeySt := &fakeStore{}
+	noKeySn := &fakeSvcSender{}
+	noKeySvc := newTestService(noKeySt, noKeySn, "")
+	noKeySvc.Send(context.Background(), "k", "a@b.c", nil)
+	noKeySvc.Wait()
+
+	noKeyLogs, _ := noKeySt.snapshot()
+	if len(noKeyLogs) != 1 || noKeyLogs[0].Status != StatusSkipped {
+		t.Fatalf("want one skipped row for no key configured, got %+v", noKeyLogs)
+	}
+	if noKeyLogs[0].Error == nil || *noKeyLogs[0].Error != reasonNotConfigured {
+		t.Fatalf("want reason %q for no key configured, got %v", reasonNotConfigured, noKeyLogs[0].Error)
+	}
+
+	// The load-bearing assertion: the two audit rows must not share a reason.
+	if *resolverErrLogs[0].Error == *noKeyLogs[0].Error {
+		t.Fatalf("resolver-error and no-key-configured must write different reasons, both got %q",
+			*resolverErrLogs[0].Error)
 	}
 }
 
