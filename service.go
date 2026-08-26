@@ -108,6 +108,15 @@ type Config struct {
 	// An error from Resolve skips the send. It deliberately does NOT fall back
 	// to APIKey/From: sending with credentials the operator believes they
 	// replaced is worse than not sending.
+	//
+	// PII/SECRET CONTRACT: the returned error MUST NOT embed the API key, the
+	// recipient address, or any other secret. emailkit logs it verbatim
+	// ("err", err) on the resolver-error path in deliver, so an implementation
+	// that wraps as fmt.Errorf("invalid key %q: %w", apiKey, err) puts the key
+	// straight into the application log. emailkit cannot enforce this:
+	// redacting arbitrary error text is not reliable, which is why it is
+	// stated here as a contract — the same reasoning the Store doc gives for
+	// its own methods.
 	Resolve func(ctx context.Context) (apiKey, from string, err error)
 }
 
@@ -122,6 +131,17 @@ const (
 	reasonSuppressionLookup = "Suppression lookup failed; send withheld"
 	reasonNothingToSend     = "Empty subject and body; nothing to send"
 	reasonPanicked          = "Send panicked; see application logs"
+
+	// reasonResolverFailed is distinct from reasonNotConfigured on purpose: the
+	// two are different failures that must not share an audit reason. Resolve
+	// returning an error means credentials exist somewhere but resolving them
+	// failed (the settings table was unreachable, a key failed to decrypt, and
+	// so on) — reasonNotConfigured would tell an auditor no key was ever set up,
+	// which is false. The underlying error is NOT included here: it is
+	// consumer-supplied and may contain anything (see the Store doc's PII
+	// contract); slog already records it, and this row only needs to say that
+	// resolution failed, not why.
+	reasonResolverFailed = "Credential resolution failed; send withheld"
 )
 
 // Service is the only way to send. wg tracks in-flight sends so tests can
@@ -308,7 +328,7 @@ func (s *Service) deliver(ctx context.Context, to, subject, html, label string) 
 	if err != nil {
 		s.log().Warn("email credential resolution failed",
 			"label", label, "domain", domainOf(to), "err", err)
-		s.audit(ctx, to, subject, label, StatusSkipped, nil, strp(reasonNotConfigured))
+		s.audit(ctx, to, subject, label, StatusSkipped, nil, strp(reasonResolverFailed))
 		return
 	}
 	if apiKey == "" {
